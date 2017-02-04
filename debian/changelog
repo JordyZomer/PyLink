@@ -1,3 +1,13 @@
+pylink (1.1.0.1-0utopia1) unstable; urgency=medium
+
+  * New release.
+  * Add python3-passlib to recommends.
+  * Add patch mkpasswd-updates.patch, backporting commits 62c4b79e04 and
+    0d99bc62d2 from Git master. This tweaks setup.py to install
+    pylink-mkpasswd, and adds support for secure input via getpass.
+
+ -- James Lu <bitflip3@gmail.com>  Fri, 03 Feb 2017 18:13:41 -0800
+
 pylink (1.0.4-0utopia1~deb8u1) jessie; urgency=medium
 
   * Rebuild for Debian Jessie.

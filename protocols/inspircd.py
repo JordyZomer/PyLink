@@ -3,9 +3,6 @@ inspircd.py: InspIRCd 2.x protocol module for PyLink.
 """
 
 import time
-import sys
-import os
-import re
 import threading
 
 from pylinkirc import utils
@@ -53,7 +50,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         realname = realname or self.irc.botdata['realname']
         realhost = realhost or host
         raw_modes = self.irc.joinModes(modes)
-        u = self.irc.users[uid] = IrcUser(nick, ts, uid, ident=ident, host=host, realname=realname,
+        u = self.irc.users[uid] = IrcUser(nick, ts, uid, server, ident=ident, host=host, realname=realname,
             realhost=realhost, ip=ip, manipulatable=manipulatable, opertype=opertype)
 
         self.irc.applyModes(uid, modes)
@@ -74,10 +71,12 @@ class InspIRCdProtocol(TS6BaseProtocol):
         # so what we're actually doing here is sending FJOIN from the server,
         # on behalf of the clients that are joining.
         channel = self.irc.toLower(channel)
-        server = self.irc.isInternalClient(client)
-        if not server:
+
+        server = self.irc.getServer(client)
+        if not self.irc.isInternalServer(server):
             log.error('(%s) Error trying to join %r to %r (no such client exists)', self.irc.name, client, channel)
             raise LookupError('No such PyLink client exists.')
+
         # Strip out list-modes, they shouldn't be ever sent in FJOIN.
         modes = [m for m in self.irc.channels[channel].modes if m[0] not in self.irc.cmodes['*A']]
         self._send(server, "FJOIN {channel} {ts} {modes} :,{uid}".format(
@@ -508,15 +507,6 @@ class InspIRCdProtocol(TS6BaseProtocol):
         if self.irc.isInternalServer(args[1]):
             self._send(args[1], 'PONG %s %s' % (args[1], source))
 
-    def handle_pong(self, source, command, args):
-        """Handles incoming PONG commands.
-
-        This is used to keep track of whether the uplink is alive by the Irc()
-        internals - a server that fails to reply to our PINGs eventually
-        times out and is disconnected."""
-        if source == self.irc.uplink and args[1] == self.irc.sid:
-            self.irc.lastping = time.time()
-
     def handle_fjoin(self, servernumeric, command, args):
         """Handles incoming FJOIN commands (InspIRCd equivalent of JOIN/SJOIN)."""
         # :70M FJOIN #chat 1423790411 +AFPfjnt 6:5 7:5 9:5 :o,1SRAABIT4 v,1IOAAF53R <...>
@@ -527,7 +517,6 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
         modestring = args[2:-1] or args[2]
         parsedmodes = self.irc.parseModes(channel, modestring)
-        self.irc.applyModes(channel, parsedmodes)
         namelist = []
 
         # Keep track of other modes that are added due to prefix modes being joined too.
@@ -564,7 +553,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         uid, ts, nick, realhost, host, ident, ip = args[0:7]
         self.checkCollision(nick)
         realname = args[-1]
-        self.irc.users[uid] = userobj = IrcUser(nick, ts, uid, ident, host, realname, realhost, ip)
+        self.irc.users[uid] = userobj = IrcUser(nick, ts, uid, numeric, ident, host, realname, realhost, ip)
 
         parsedmodes = self.irc.parseModes(uid, [args[8], args[9]])
         self.irc.applyModes(uid, parsedmodes)
@@ -703,7 +692,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
 
     def handle_fhost(self, numeric, command, args):
         """Handles FHOST, used for denoting hostname changes."""
-        # <- :70MAAAAAB FIDENT some.host
+        # <- :70MAAAAAB FHOST some.host
         self.irc.users[numeric].host = newhost = args[0]
         return {'target': numeric, 'newhost': newhost}
 
@@ -775,7 +764,6 @@ class InspIRCdProtocol(TS6BaseProtocol):
         """
         Stub VERSION handler (does nothing) to override the one in ts6_common.
         """
-        pass
 
     def handle_kill(self, source, command, args):
         """Handles incoming KILLs."""

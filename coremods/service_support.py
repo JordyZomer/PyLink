@@ -51,6 +51,9 @@ def spawn_service(irc, source, command, args):
     userobj = irc.proto.spawnClient(nick, ident, host, modes=modes, opertype="PyLink Service",
                                     manipulatable=sbot.manipulatable)
 
+    # Store the service name in the IrcUser object for easier access.
+    userobj.service = name
+
     sbot.uids[irc.name] = u = userobj.uid
 
     # Special case: if this is the main PyLink client being spawned,
@@ -62,13 +65,7 @@ def spawn_service(irc, source, command, args):
     # TODO: channels should be tracked in a central database, not hardcoded
     # in conf.
     channels = set(irc.serverdata.get('channels', [])) | sbot.extra_channels.get(irc.name, set())
-
-    for chan in channels:
-        if utils.isChannel(chan):
-            irc.proto.join(u, chan)
-            irc.callHooks([irc.sid, 'PYLINK_SERVICE_JOIN', {'channel': chan, 'users': [u]}])
-        else:
-            log.warning('(%s) Ignoring invalid autojoin channel %r.', irc.name, chan)
+    sbot.join(irc, channels)
 
 utils.add_hook(spawn_service, 'PYLINK_NEW_SERVICE')
 
@@ -97,7 +94,7 @@ utils.add_hook(handle_endburst, 'ENDBURST')
 def handle_kill(irc, source, command, args):
     """Handle KILLs to PyLink service bots, respawning them as needed."""
     target = args['target']
-    sbot = irc.isServiceBot(target)
+    sbot = irc.getServiceBot(target)
     if sbot:
         spawn_service(irc, source, command, {'name': sbot.name})
         return
@@ -107,9 +104,9 @@ def handle_kick(irc, source, command, args):
     """Handle KICKs to the PyLink service bots, rejoining channels as needed."""
     kicked = args['target']
     channel = args['channel']
-    if irc.isServiceBot(kicked):
-        irc.proto.join(kicked, channel)
-        irc.callHooks([irc.sid, 'PYLINK_SERVICE_JOIN', {'channel': channel, 'users': [kicked]}])
+    sbot = irc.getServiceBot(kicked)
+    if sbot:
+        sbot.join(irc, channel)
 utils.add_hook(handle_kick, 'KICK')
 
 def handle_commands(irc, source, command, args):
@@ -117,7 +114,7 @@ def handle_commands(irc, source, command, args):
     target = args['target']
     text = args['text']
 
-    sbot = irc.isServiceBot(target)
+    sbot = irc.getServiceBot(target)
     if sbot:
         sbot.call_cmd(irc, source, text)
 

@@ -3,14 +3,14 @@ ts6.py: PyLink protocol module for TS6-based IRCds (charybdis, elemental-ircd).
 """
 
 import time
-import sys
-import os
 import re
 
 from pylinkirc import utils
 from pylinkirc.classes import *
 from pylinkirc.log import log
 from pylinkirc.protocols.ts6_common import *
+
+S2S_BUFSIZE = 510
 
 class TS6Protocol(TS6BaseProtocol):
     def __init__(self, irc):
@@ -21,6 +21,8 @@ class TS6Protocol(TS6BaseProtocol):
 
         # Track whether we've received end-of-burst from the uplink.
         self.has_eob = False
+
+        self.required_caps = {'EUID', 'SAVE', 'TB', 'ENCAP', 'QS', 'CHW'}
 
     ### OUTGOING COMMANDS
 
@@ -47,7 +49,7 @@ class TS6Protocol(TS6BaseProtocol):
         realname = realname or self.irc.botdata['realname']
         realhost = realhost or host
         raw_modes = self.irc.joinModes(modes)
-        u = self.irc.users[uid] = IrcUser(nick, ts, uid, ident=ident, host=host, realname=realname,
+        u = self.irc.users[uid] = IrcUser(nick, ts, uid, server, ident=ident, host=host, realname=realname,
             realhost=realhost, ip=ip, manipulatable=manipulatable, opertype=opertype)
 
         self.irc.applyModes(uid, modes)
@@ -106,14 +108,18 @@ class TS6Protocol(TS6BaseProtocol):
 
         # Get all the ban modes in a separate list. These are bursted using a separate BMASK
         # command.
-        banmodes = {k: set() for k in self.irc.cmodes['*A']}
+        banmodes = {k: [] for k in self.irc.cmodes['*A']}
         regularmodes = []
         log.debug('(%s) Unfiltered SJOIN modes: %s', self.irc.name, modes)
         for mode in modes:
             modechar = mode[0][-1]
             if modechar in self.irc.cmodes['*A']:
                 # Mode character is one of 'beIq'
-                banmodes[modechar].add(mode[1])
+                if (modechar, mode[1]) in self.irc.channels[channel].modes:
+                    # Don't reset modes that are already set.
+                    continue
+
+                banmodes[modechar].append(mode[1])
             else:
                 regularmodes.append(mode)
         log.debug('(%s) Filtered SJOIN modes to be regular modes: %s, banmodes: %s', self.irc.name, regularmodes, banmodes)
@@ -152,11 +158,11 @@ class TS6Protocol(TS6BaseProtocol):
             # line)
             if bans:
                 log.debug('(%s) sjoin: bursting mode %s with bans %s, ts:%s', self.irc.name, bmode, bans, ts)
-                bans = list(bans)  # Convert into list for splicing
-                while bans[:12]:
-                    self._send(server, "BMASK {ts} {channel} {bmode} :{bans}".format(ts=ts,
-                               channel=channel, bmode=bmode, bans=' '.join(bans[:12])))
-                    bans = bans[12:]
+                msgprefix = ':{sid} BMASK {ts} {channel} {bmode} :'.format(sid=server, ts=ts,
+                                                                          channel=channel, bmode=bmode)
+                # Actually, we cut off at 17 arguments/line, since the prefix and command name don't count.
+                for msg in utils.wrapArguments(msgprefix, bans, S2S_BUFSIZE, max_args_per_line=17):
+                    self.irc.send(msg)
 
         self.updateTS(server, channel, ts, changedmodes)
 
@@ -179,12 +185,11 @@ class TS6Protocol(TS6BaseProtocol):
 
             # On output, at most ten cmode parameters should be sent; if there are more,
             # multiple TMODE messages should be sent.
-            while modes[:10]:
-                # Seriously, though. If you send more than 10 mode parameters in
-                # a line, charybdis will silently REJECT the entire command!
-                joinedmodes = self.irc.joinModes([m for m in modes[:10] if m[0] not in self.irc.cmodes['*A']])
-                modes = modes[10:]
-                self._send(numeric, 'TMODE %s %s %s' % (ts, target, joinedmodes))
+            msgprefix = ':%s TMODE %s %s ' % (numeric, ts, target)
+            bufsize = S2S_BUFSIZE - len(msgprefix)
+
+            for modestr in self.irc.wrapModes(modes, bufsize, max_modes_per_msg=10):
+                self.irc.send(msgprefix + modestr)
         else:
             joinedmodes = self.irc.joinModes(modes)
             self._send(numeric, 'MODE %s %s' % (target, joinedmodes))
@@ -330,7 +335,7 @@ class TS6Protocol(TS6BaseProtocol):
         # RSFNC: states that we support RSFNC (forced nick changed attempts). XXX: With atheme services,
         #        does this actually do anything?
         # EOPMOD: supports ETB (extended TOPIC burst) and =#channel messages for opmoderated +z
-        f('CAPAB :QS ENCAP EX CHW IE KNOCK SAVE SERVICES TB EUID RSFNC EOPMOD')
+        f('CAPAB :QS ENCAP EX CHW IE KNOCK SAVE SERVICES TB EUID RSFNC EOPMOD SAVETS_100')
 
         f('SERVER %s 0 :%s' % (self.irc.serverdata["hostname"],
                                self.irc.serverdata.get('serverdesc') or self.irc.botdata['serverdesc']))
@@ -370,7 +375,7 @@ class TS6Protocol(TS6BaseProtocol):
         # <- CAPAB :BAN CHW CLUSTER ENCAP EOPMOD EUID EX IE KLN KNOCK MLOCK QS RSFNC SAVE SERVICES TB UNKLN
         self.irc.caps = caps = args[0].split()
 
-        for required_cap in ('EUID', 'SAVE', 'TB', 'ENCAP', 'QS', 'CHW'):
+        for required_cap in self.required_caps:
             if required_cap not in caps:
                 raise ProtocolError('%s not found in TS6 capabilities list; this is required! (got %r)' % (required_cap, caps))
 
@@ -410,12 +415,6 @@ class TS6Protocol(TS6BaseProtocol):
 
                 # Return the endburst hook.
                 return {'parse_as': 'ENDBURST'}
-
-
-    def handle_pong(self, source, command, args):
-        """Handles incoming PONG commands."""
-        if source == self.irc.uplink:
-            self.irc.lastping = time.time()
 
     def handle_sjoin(self, servernumeric, command, args):
         """Handles incoming SJOIN commands."""
@@ -512,7 +511,7 @@ class TS6Protocol(TS6BaseProtocol):
         if ip == '0':  # IP was invalid; something used for services.
             ip = '0.0.0.0'
 
-        self.irc.users[uid] = IrcUser(nick, ts, uid, ident, host, realname, realhost, ip)
+        self.irc.users[uid] = IrcUser(nick, ts, uid, numeric, ident, host, realname, realhost, ip)
 
         parsedmodes = self.irc.parseModes(uid, [modes])
         log.debug('Applying modes %s for %s', parsedmodes, uid)
@@ -531,8 +530,23 @@ class TS6Protocol(TS6BaseProtocol):
         return {'uid': uid, 'ts': ts, 'nick': nick, 'realhost': realhost, 'host': host, 'ident': ident, 'ip': ip}
 
     def handle_uid(self, numeric, command, args):
-        raise ProtocolError("Servers should use EUID instead of UID to send users! "
-                            "This IS a required capability after all...")
+        """Handles legacy user introductions (UID)."""
+        # tl;dr We want to convert the following UID parameters:
+        #    nickname, hopcount, nickTS, umodes, username, visible hostname, IP address, UID, gecos
+        # to EUID parameters when parsing:
+        #    nickname, hopcount, nickTS, umodes, username, visible hostname, IP address, UID,
+        #    real hostname, account name, gecos
+
+        euid_args = args[:]
+
+        # Insert a * to denote that the user is not logged in.
+        euid_args.insert(8, '*')
+
+        # Copy the visible hostname to the real hostname, as this data isn't sent yet.
+        # TODO: handle encap realhost / encap login
+        euid_args.insert(8, args[5])
+
+        return self.handle_euid(numeric, command, euid_args)
 
     def handle_sid(self, numeric, command, args):
         """Handles incoming server introductions."""

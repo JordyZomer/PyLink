@@ -21,6 +21,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Starts an instance of PyLink IRC Services.')
     parser.add_argument('config', help='specifies the path to the config file (defaults to pylink.yml)', nargs='?', default='pylink.yml')
     parser.add_argument("-v", "--version", help="displays the program version and exits", action='store_true')
+    parser.add_argument("-c", "--check-pid", help="enables PID file checking", action='store_true')
     parser.add_argument("-n", "--no-pid", help="skips generating PID files", action='store_true')
     args = parser.parse_args()
 
@@ -28,12 +29,30 @@ if __name__ == '__main__':
         print('PyLink %s (in VCS: %s)' % (__version__, real_version))
         sys.exit()
 
-    # Load the config
+    # FIXME: we can't pass logging on to conf until we set up the config...
     conf.loadConf(args.config)
 
     from pylinkirc.log import log
     from pylinkirc import classes, utils, coremods
     log.info('PyLink %s starting...', __version__)
+
+    # Set terminal window title. See https://bbs.archlinux.org/viewtopic.php?id=85567
+    # and https://stackoverflow.com/questions/7387276/
+    if os.name == 'nt':
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleTitleW("PyLink %s" % __version__)
+    elif os.name == 'posix':
+        sys.stdout.write("\x1b]2;PyLink %s\x07" % __version__)
+
+    # Check for a pid file. This stops instance overlap and user mistakes, which are especially an
+    # issue for clientbot...
+    if args.check_pid:
+        config = conf.confname
+        if os.path.exists("%s.pid" % config):
+            log.error("PID file exists; aborting! If PyLink didn't shut down cleanly last time it "
+                      "was run, or you're upgrading from PyLink < 1.1-dev, delete %s.pid and try "
+                      "again." % config)
+            sys.exit(1)
 
     # Write a PID file unless specifically told not to.
     if not args.no_pid:

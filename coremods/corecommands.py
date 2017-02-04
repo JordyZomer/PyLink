@@ -9,12 +9,24 @@ import gc
 import sys
 import importlib
 
-from . import control
+from . import control, login, permissions
 from pylinkirc import utils, world, conf
 from pylinkirc.log import log
 
 # Essential, core commands go here so that the "commands" plugin with less-important,
 # but still generic functions can be reloaded.
+
+def _login(irc, source, username):
+    """Internal function to process logins."""
+    irc.users[source].account = username
+    irc.reply('Successfully logged in as %s.' % username)
+    log.info("(%s) Successful login to %r by %s",
+             irc.name, username, irc.getHostmask(source))
+
+def _loginfail(irc, source, username):
+    """Internal function to process login failures."""
+    irc.error('Incorrect credentials.')
+    log.warning("(%s) Failed login to %r from %s", irc.name, username, irc.getHostmask(source))
 
 @utils.add_cmd
 def identify(irc, source, args):
@@ -30,25 +42,29 @@ def identify(irc, source, args):
     except IndexError:
         irc.reply('Error: Not enough arguments.')
         return
-    # Usernames are case-insensitive, passwords are NOT.
-    if username.lower() == conf.conf['login']['user'].lower() and password == conf.conf['login']['password']:
+
+    # Process new-style accounts.
+    if login.checkLogin(username, password):
+        _login(irc, source, username)
+        return
+
+    # Process legacy logins (login:user).
+    if username.lower() == conf.conf['login'].get('user', '').lower() and password == conf.conf['login'].get('password'):
         realuser = conf.conf['login']['user']
-        irc.users[source].account = realuser
-        irc.reply('Successfully logged in as %s.' % realuser)
-        log.info("(%s) Successful login to %r by %s",
-                 irc.name, username, irc.getHostmask(source))
+        _login(irc, source, realuser)
     else:
-        irc.reply('Error: Incorrect credentials.')
-        u = irc.users[source]
-        log.warning("(%s) Failed login to %r from %s",
-                    irc.name, username, irc.getHostmask(source))
+        # Username not found.
+        _loginfail(irc, source, username)
+
 
 @utils.add_cmd
 def shutdown(irc, source, args):
     """takes no arguments.
 
     Exits PyLink by disconnecting all networks."""
-    irc.checkAuthenticated(source, allowOper=False)
+
+    permissions.checkPermissions(irc, source, ['core.shutdown'])
+
     u = irc.users[source]
 
     log.info('(%s) SHUTDOWN requested by "%s!%s@%s", exiting...', irc.name, u.nick,
@@ -61,7 +77,10 @@ def load(irc, source, args):
     """<plugin name>.
 
     Loads a plugin from the plugin folder."""
-    irc.checkAuthenticated(source, allowOper=False)
+    # Note: reload capability is acceptable here, because all it actually does is call
+    # load after unload.
+    permissions.checkPermissions(irc, source, ['core.load', 'core.reload'])
+
     try:
         name = args[0]
     except IndexError:
@@ -90,6 +109,7 @@ def unload(irc, source, args):
     """<plugin name>.
 
     Unloads a currently loaded plugin."""
+    permissions.checkPermissions(irc, source, ['core.unload', 'core.reload'])
     irc.checkAuthenticated(source, allowOper=False)
     try:
         name = args[0]
@@ -163,6 +183,8 @@ def reload(irc, source, args):
     except IndexError:
         irc.reply("Error: Not enough arguments. Needs 1: plugin name.")
         return
+
+    # Note: these functions do permission checks, so there are none needed here.
     if unload(irc, source, args):
         load(irc, source, args)
 
@@ -171,8 +193,9 @@ def rehash(irc, source, args):
     """takes no arguments.
 
     Reloads the configuration file for PyLink, (dis)connecting added/removed networks.
-    Plugins must be manually reloaded."""
-    irc.checkAuthenticated(source, allowOper=False)
+
+    Note: plugins must be manually reloaded."""
+    permissions.checkPermissions(irc, source, ['core.rehash'])
     try:
         control._rehash()
     except Exception as e:  # Something went wrong, abort.

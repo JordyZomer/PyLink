@@ -1,7 +1,4 @@
 import time
-import sys
-import os
-import re
 
 from pylinkirc import utils
 from pylinkirc.log import log
@@ -47,9 +44,9 @@ class HybridProtocol(TS6Protocol):
             'callerid': 'g', 'admin': 'a', 'deaf_commonchan': 'G', 'hideoper': 'H',
             'webirc': 'W', 'sno_clientconnections': 'c', 'sno_badclientconnections': 'u',
             'sno_rejectedclients': 'j', 'sno_skill': 'k', 'sno_fullauthblock': 'f',
-            'sno_remoteclientconnections': 'F', 'sno_admin_requests': 'y', 'sno_debug': 'd',
+            'sno_remoteclientconnections': 'F', 'sno_stats': 'y', 'sno_debug': 'd',
             'sno_nickchange': 'n', 'hideidle': 'q', 'registered': 'r',
-            'snomask': 's', 'ssl': 'S', 'sno_server_connects': 'e', 'sno_botfloods': 'b',
+            'snomask': 's', 'ssl': 'S', 'sno_serverconnects': 'e', 'sno_botfloods': 'b',
             # Now, map all the ABCD type modes:
             '*A': '', '*B': '', '*C': '', '*D': 'DFGHRSWabcdefgijklnopqrsuwxy'
         }
@@ -107,7 +104,7 @@ class HybridProtocol(TS6Protocol):
         realname = realname or self.irc.botdata['realname']
         realhost = realhost or host
         raw_modes = self.irc.joinModes(modes)
-        u = self.irc.users[uid] = IrcUser(nick, ts, uid, ident=ident, host=host, realname=realname,
+        u = self.irc.users[uid] = IrcUser(nick, ts, uid, server, ident=ident, host=host, realname=realname,
             realhost=realhost, ip=ip, manipulatable=manipulatable)
         self.irc.applyModes(uid, modes)
         self.irc.servers[server].users.add(uid)
@@ -179,7 +176,7 @@ class HybridProtocol(TS6Protocol):
                   'host=%s realname=%s ip=%s', self.irc.name, nick, ts, uid,
                   ident, host, realname, ip)
 
-        self.irc.users[uid] = IrcUser(nick, ts, uid, ident, host, realname, host, ip)
+        self.irc.users[uid] = IrcUser(nick, ts, uid, numeric, ident, host, realname, host, ip)
 
         parsedmodes = self.irc.parseModes(uid, [modes])
         log.debug('(%s) handle_uid: Applying modes %s for %s', self.irc.name, parsedmodes, uid)

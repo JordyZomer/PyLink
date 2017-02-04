@@ -8,7 +8,6 @@ Here be dragons.
 """
 
 import threading
-from random import randint
 import time
 import socket
 import ssl
@@ -21,7 +20,7 @@ from collections import defaultdict, deque
 try:
     import ircmatch
 except ImportError:
-    raise ImportError("Please install the ircmatch library and try again.")
+    raise ImportError("PyLink requires ircmatch to function; please install it and try again.")
 
 from . import world, utils, structures, __version__
 from .log import *
@@ -48,7 +47,6 @@ class Irc():
         self.sid = None
         self.serverdata = conf['servers'][netname]
         self.botdata = conf['bot']
-        self.bot_clients = {}
         self.protoname = proto.__name__.split('.')[-1]  # Remove leading pylinkirc.protocols.
         self.proto = proto.Class(self)
         self.pingfreq = self.serverdata.get('pingfreq') or 90
@@ -181,6 +179,7 @@ class Irc():
         __init__ in a separate thread to allow multiple concurrent connections.
         """
         while True:
+
             self.aborted.clear()
             self.initVars()
 
@@ -200,6 +199,10 @@ class Irc():
                 # Creat the socket.
                 self.socket = socket.socket(stype)
                 self.socket.setblocking(0)
+
+                # Set the socket bind if applicable.
+                if 'bindhost' in self.serverdata:
+                    self.socket.bind((self.serverdata['bindhost'], 0))
 
                 # Set the connection timeouts. Initial connection timeout is a
                 # lot smaller than the timeout after we've connected; this is
@@ -327,6 +330,11 @@ class Irc():
             if autoconnect is not None and autoconnect >= 1:
                 log.info('(%s) Going to auto-reconnect in %s seconds.', self.name, autoconnect)
                 time.sleep(autoconnect)
+
+                if self not in world.networkobjects.values():
+                    log.debug('Stopping stale connect loop for old connection %r', self.name)
+                    return
+
             else:
                 log.info('(%s) Stopping connect loop (autoconnect value %r is < 1).', self.name, autoconnect)
                 return
@@ -458,7 +466,6 @@ class Irc():
         stripped_data = data.decode("utf-8").strip("\n")
         log.debug("(%s) -> %s", self.name, stripped_data)
 
-
         try:
             self.socket.send(data)
         except (OSError, AttributeError):
@@ -529,6 +536,13 @@ class Irc():
             target = self.called_in
 
         self.msg(target, text, notice=notice, source=source, loopback=loopback)
+
+    def error(self, text, notice=False, source=None, private=False, force_privmsg_in_private=False,
+            loopback=True):
+        """Replies with an error to the last caller in the right context (channel or PM)."""
+        # This is a stub to alias error to reply
+        self.reply("Error: %s" % text, notice=notice, source=source, private=private,
+            force_privmsg_in_private=force_privmsg_in_private, loopback=loopback)
 
     def toLower(self, text):
         """Returns a lowercase representation of text based on the IRC object's
@@ -602,17 +616,26 @@ class Irc():
                         # Must have parameter.
                         log.debug('Mode %s: This mode must have parameter.', mode)
                         arg = args.pop(0)
-                        if prefix == '-' and mode in supported_modes['*B'] and arg == '*':
-                            # Charybdis allows unsetting +k without actually
-                            # knowing the key by faking the argument when unsetting
-                            # as a single "*".
-                            # We'd need to know the real argument of +k for us to
-                            # be able to unset the mode.
-                            oldargs = [m[1] for m in oldmodes if m[0] == mode]
-                            if oldargs:
-                                # Set the arg to the old one on the channel.
-                                arg = oldargs[0]
-                                log.debug("Mode %s: coersing argument of '*' to %r.", mode, arg)
+                        if prefix == '-':
+                            if mode in supported_modes['*B'] and arg == '*':
+                                # Charybdis allows unsetting +k without actually
+                                # knowing the key by faking the argument when unsetting
+                                # as a single "*".
+                                # We'd need to know the real argument of +k for us to
+                                # be able to unset the mode.
+                                oldarg = dict(oldmodes).get(mode)
+                                if oldarg:
+                                    # Set the arg to the old one on the channel.
+                                    arg = oldarg
+                                    log.debug("Mode %s: coersing argument of '*' to %r.", mode, arg)
+
+                            log.debug('(%s) parseModes: checking if +%s %s is in old modes list: %s', self.name, mode, arg, oldmodes)
+
+                            if (mode, arg) not in oldmodes:
+                                # Ignore attempts to unset bans that don't exist.
+                                log.debug("(%s) parseModes(): ignoring removal of non-existent list mode +%s %s", self.name, mode, arg)
+                                continue
+
                     elif prefix == '+' and mode in supported_modes['*C']:
                         # Only has parameter when setting.
                         log.debug('Mode %s: Only has parameter when setting.', mode)
@@ -841,6 +864,79 @@ class Irc():
             modelist += ' %s' % ' '.join(args)
         return modelist
 
+    @classmethod
+    def wrapModes(cls, modes, limit, max_modes_per_msg=0):
+        """
+        Takes a list of modes and wraps it across multiple lines.
+        """
+        strings = []
+
+        # This process is slightly trickier than just wrapping arguments, because modes create
+        # positional arguments that can't be separated from its character.
+        queued_modes = []
+        total_length = 0
+
+        last_prefix = '+'
+        orig_modes = modes.copy()
+        modes = list(modes)
+        while modes:
+            # PyLink mode lists come in the form [('+t', None), ('-b', '*!*@someone'), ('+l', 3)]
+            # The +/- part is optional depending on context, and should either:
+            # 1) The prefix of the last mode.
+            # 2) + (adding modes), if no prefix was ever given
+            next_mode = modes.pop(0)
+
+            modechar, arg = next_mode
+            prefix = modechar[0]
+            if prefix not in '+-':
+                prefix = last_prefix
+                # Explicitly add the prefix to the mode character to prevent
+                # ambiguity when passing it to joinModes().
+                modechar = prefix + modechar
+                # XXX: because tuples are immutable, we have to replace the entire modepair..
+                next_mode = (modechar, arg)
+
+            # Figure out the length that the next mode will add to the buffer. If we're changing
+            # from + to - (setting to removing modes) or vice versa, we'll need two characters
+            # ("+" or "-") plus the mode char itself.
+            next_length = 1
+            if prefix != last_prefix:
+                next_length += 1
+
+            # Replace the last_prefix with the current one for the next iteration.
+            last_prefix = prefix
+
+            if arg:
+                # This mode has an argument, so add the length of that and a space.
+                next_length += 1
+                next_length += len(arg)
+
+            assert next_length <= limit, \
+                "wrapModes: Mode %s is too long for the given length %s" % (next_mode, limit)
+
+            # Check both message length and max. modes per msg if enabled.
+            if (next_length + total_length) <= limit and ((not max_modes_per_msg) or len(queued_modes) < max_modes_per_msg):
+                # We can fit this mode in the next message; add it.
+                total_length += next_length
+                log.debug('wrapModes: Adding mode %s to queued modes', str(next_mode))
+                queued_modes.append(next_mode)
+                log.debug('wrapModes: queued modes: %s', queued_modes)
+            else:
+                # Otherwise, create a new message by joining the previous queue.
+                # Then, add our current mode.
+                strings.append(cls.joinModes(queued_modes))
+                queued_modes.clear()
+
+                log.debug('wrapModes: cleared queue (length %s) and now adding %s', limit, str(next_mode))
+                queued_modes.append(next_mode)
+                total_length = next_length
+        else:
+            # Everything fit in one line, so just use that.
+            strings.append(cls.joinModes(queued_modes))
+
+        log.debug('wrapModes: returning %s for %s', strings, orig_modes)
+        return strings
+
     def version(self):
         """
         Returns a detailed version string including the PyLink daemon version,
@@ -865,12 +961,11 @@ class Irc():
 
     def isInternalClient(self, numeric):
         """
-        Checks whether the given numeric is a PyLink Client,
-        returning the SID of the server it's on if so.
+        Returns whether the given client numeric (UID) is a PyLink client.
         """
-        for sid in self.servers:
-            if self.servers[sid].internal and numeric in self.servers[sid].users:
-                return sid
+        sid = self.getServer(numeric)
+        if sid and self.servers[sid].internal:
+            return True
         return False
 
     def isInternalServer(self, sid):
@@ -879,9 +974,9 @@ class Irc():
 
     def getServer(self, numeric):
         """Finds the SID of the server a user is on."""
-        for server in self.servers:
-            if numeric in self.servers[server].users:
-                return server
+        userobj = self.users.get(numeric)
+        if userobj:
+            return userobj.server
 
     def isManipulatableClient(self, uid):
         """
@@ -892,17 +987,25 @@ class Irc():
         """
         return self.isInternalClient(uid) and self.users[uid].manipulatable
 
-    def isServiceBot(self, uid):
+    def getServiceBot(self, uid):
         """
         Checks whether the given UID is a registered service bot. If True,
         returns the cooresponding ServiceBot object.
         """
-        if not uid:
+        userobj = self.users.get(uid)
+        if not userobj:
             return False
-        for sbot in world.services.values():
-            if uid == sbot.uids.get(self.name):
-                return sbot
-        return False
+
+        # Look for the "service" attribute in the IrcUser object, if one exists.
+        try:
+            sname = userobj.service
+            # Warn if the service name we fetched isn't a registered service.
+            if sname not in world.services.keys():
+                log.warning("(%s) User %s / %s had a service bot record to a service that doesn't "
+                            "exist (%s)!", self.name, uid, userobj.nick, sname)
+            return world.services.get(sname)
+        except AttributeError:
+            return False
 
     def getHostmask(self, user, realhost=False, ip=False):
         """
@@ -1031,7 +1134,7 @@ class Irc():
 
 class IrcUser():
     """PyLink IRC user class."""
-    def __init__(self, nick, ts, uid, ident='null', host='null',
+    def __init__(self, nick, ts, uid, server, ident='null', host='null',
                  realname='PyLink dummy client', realhost='null',
                  ip='0.0.0.0', manipulatable=False, opertype='IRC Operator'):
         self.nick = nick
@@ -1043,6 +1146,7 @@ class IrcUser():
         self.ip = ip
         self.realname = realname
         self.modes = set()  # Tracks user modes
+        self.server = server
 
         # Tracks PyLink identification status
         self.account = ''
@@ -1092,7 +1196,7 @@ class IrcChannel():
     def __init__(self, name=None):
         # Initialize variables, such as the topic, user list, TS, who's opped, etc.
         self.users = set()
-        self.modes = {('n', None), ('t', None)}
+        self.modes = set()
         self.topic = ''
         self.ts = int(time.time())
         self.prefixmodes = {'op': set(), 'halfop': set(), 'voice': set(),
@@ -1295,9 +1399,12 @@ class Protocol():
                 _apply()
 
             elif (their_ts < our_ts):
-                log.debug('(%s) Resetting channel TS of %s from %s to %s (remote has lower TS)',
-                          self.irc.name, channel, our_ts, their_ts)
-                self.irc.channels[channel].ts = their_ts
+                if their_ts < 750000:
+                    log.warning('(%s) Possible desync? Not setting bogus TS %s on channel %s', self.irc.name, their_ts, channel)
+                else:
+                    log.debug('(%s) Resetting channel TS of %s from %s to %s (remote has lower TS)',
+                              self.irc.name, channel, our_ts, their_ts)
+                    self.irc.channels[channel].ts = their_ts
 
                 # Remote TS was lower and we're receiving modes. Clear the modelist and apply theirs.
 
@@ -1383,7 +1490,8 @@ class Protocol():
                 'uplink': uplink, 'nicks': affected_nicks, 'serverdata': serverdata,
                 'channeldata': old_channels}
 
-    def parseCapabilities(self, args):
+    @staticmethod
+    def parseCapabilities(args, fallback=''):
         """
         Parses a string of capabilities in the 005 / RPL_ISUPPORT format.
         """
@@ -1398,7 +1506,7 @@ class Protocol():
                 key, value = cap.split('=', 1)
             except ValueError:
                 key = cap
-                value = ''
+                value = fallback
             caps[key] = value
 
         return caps

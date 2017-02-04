@@ -2,6 +2,7 @@
 import string
 import collections
 import time
+import hashlib
 
 from pylinkirc import utils, conf, world
 from pylinkirc.log import log
@@ -24,13 +25,12 @@ default_styles = {'MESSAGE': '\x02[$colored_netname]\x02 <$colored_sender> $text
 
 def color_text(s):
     """
-    Returns a colorized version of the given text based on a simple hash algorithm
-    (sum of all characters).
+    Returns a colorized version of the given text based on a simple hash algorithm.
     """
     colors = ('02', '03', '04', '05', '06', '07', '08', '09', '10', '11',
-              '12', '13')
-    num = sum([ord(char) for char in s])
-    num = num % len(colors)
+              '12', '13', '15')
+    hash_output = hash(s.encode())
+    num = hash_output % len(colors)
     return "\x03%s%s\x03" % (colors[num], s)
 
 def cb_relay_core(irc, source, command, args):
@@ -87,16 +87,16 @@ def cb_relay_core(irc, source, command, args):
         text_template = string.Template(text_template)
 
         if text_template:
-            if irc.isServiceBot(source):
+            if irc.getServiceBot(source):
                 # HACK: service bots are global and lack the relay state we look for.
                 # just pretend the message comes from the current network.
                 log.debug('(%s) relay_cb_core: Overriding network origin to local (source=%s)', irc.name, source)
-                netname = irc.name
+                sourcenet = irc.name
             else:
                 # Get the original client that the relay client source was meant for.
                 log.debug('(%s) relay_cb_core: Trying to find original sender (user) for %s', irc.name, source)
                 try:
-                    origuser = relay.getOrigUser(irc, source) or args['userdata'].remote
+                    origuser = relay.get_orig_user(irc, source) or args['userdata'].remote
                 except (AttributeError, KeyError):
                     log.debug('(%s) relay_cb_core: Trying to find original sender (server) for %s. serverdata=%s', irc.name, source, args.get('serverdata'))
                     try:
@@ -105,12 +105,12 @@ def cb_relay_core(irc, source, command, args):
                         return
 
                 log.debug('(%s) relay_cb_core: Original sender found as %s', irc.name, origuser)
-                netname = origuser[0]
+                sourcenet = origuser[0]
 
             try:  # Try to get the full network name
-                netname = conf.conf['servers'][netname]['netname']
+                netname = conf.conf['servers'][sourcenet]['netname']
             except KeyError:
-                pass
+                netname = sourcenet
 
             # Figure out where the message is destined to.
             target = args.get('channel') or args.get('target')
@@ -123,7 +123,7 @@ def cb_relay_core(irc, source, command, args):
                     # No user data given. This was probably some other global event such as SQUIT.
                     userdata = irc.pseudoclient
 
-                targets = [channel for channel in userdata.channels if relay.getRelay((irc.name, channel))]
+                targets = [channel for channel in userdata.channels if relay.get_relay((irc.name, channel))]
             else:
                 # Pluralize the channel so that we can iterate over it.
                 targets = [target]
@@ -146,6 +146,11 @@ def cb_relay_core(irc, source, command, args):
 
             args.update({'netname': netname, 'sender': sourcename, 'sender_identhost': identhost,
                          'colored_sender': color_text(sourcename), 'colored_netname': color_text(netname)})
+            if 'channel' in args:
+                # Display the real channel instead of the local name, if applicable
+                args['local_channel'] = args['channel']
+                args['channel'] = relay.get_remote_channel(irc, world.networkobjects[sourcenet], args['channel'])
+                log.debug('(%s) relay_clientbot: coersing $channel from %s to %s', irc.name, args['local_channel'], args['channel'])
 
             for target in targets:
                 cargs = args.copy()  # Copy args list to manipulate them in a channel specific way
@@ -195,30 +200,30 @@ def rpm(irc, source, args):
         target = args[0]
         text = ' '.join(args[1:])
     except IndexError:
-        irc.reply('Error: Not enough arguments. Needs 2: target nick and text.')
+        irc.error('Not enough arguments. Needs 2: target nick and text.')
         return
 
     relay = world.plugins.get('relay')
     if irc.protoname != 'clientbot':
-        irc.reply('Error: This command is only supported on Clientbot networks. Try /msg %s <text>' % target)
+        irc.error('This command is only supported on Clientbot networks. Try /msg %s <text>' % target)
         return
     elif relay is None:
-        irc.reply('Error: PyLink Relay is not loaded.')
+        irc.error('PyLink Relay is not loaded.')
         return
     elif not text:
-        irc.reply('Error: No text given.')
+        irc.error('No text given.')
         return
     elif not conf.conf.get('relay').get('allow_clientbot_pms'):
-        irc.reply('Error: Private messages with users connected via Clientbot have been '
+        irc.error('Private messages with users connected via Clientbot have been '
                   'administratively disabled.')
         return
 
     uid = irc.nickToUid(target)
     if not uid:
-        irc.reply('Error: Unknown user %s.' % target)
+        irc.error('Unknown user %s.' % target)
         return
     elif not relay.isRelayClient(irc, uid):
-        irc.reply('Error: %s is not a relay user.' % target)
+        irc.error('%s is not a relay user.' % target)
         return
     else:
         assert not irc.isInternalClient(source), "rpm is not allowed from PyLink bots"

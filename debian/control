@@ -18,7 +18,7 @@ Depends: ${python3:Depends},
          ${misc:Depends},
          python3-ircmatch,
          python3-yaml
-Recommends: python3-expiringdict
+Recommends: python3-expiringdict, python3-passlib
 Suggests: pylink-doc
 Description: Multi-network IRC Services & server-side relayer
  PyLink is an extensible, plugin-based IRC services framework written in

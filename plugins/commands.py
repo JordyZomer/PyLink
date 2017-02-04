@@ -3,12 +3,27 @@ from time import ctime
 
 from pylinkirc import utils, __version__, world, real_version
 from pylinkirc.log import log
+from pylinkirc.coremods import permissions
+
+from pylinkirc.coremods.login import pwd_context
+
+default_permissions = {"*!*@*": ['commands.status', 'commands.showuser', 'commands.showchan']}
+
+def main(irc=None):
+    """Commands plugin main function, called on plugin load."""
+    # Register our permissions.
+    permissions.addDefaultPermissions(default_permissions)
+
+def die(irc):
+    """Commands plugin die function, called on plugin unload."""
+    permissions.removeDefaultPermissions(default_permissions)
 
 @utils.add_cmd
 def status(irc, source, args):
     """takes no arguments.
 
     Returns your current PyLink login status."""
+    permissions.checkPermissions(irc, source, ['commands.status'])
     identified = irc.users[source].account
     if identified:
         irc.reply('You are identified as \x02%s\x02.' % identified)
@@ -22,17 +37,18 @@ def showuser(irc, source, args):
     """<user>
 
     Shows information about <user>."""
+    permissions.checkPermissions(irc, source, ['commands.showuser'])
     try:
         target = args[0]
     except IndexError:
-        irc.reply("Error: Not enough arguments. Needs 1: nick.")
+        irc.error("Not enough arguments. Needs 1: nick.")
         return
     u = irc.nickToUid(target) or target
     # Only show private info if the person is calling 'showuser' on themselves,
     # or is an oper.
     verbose = irc.isOper(source) or u == source
     if u not in irc.users:
-        irc.reply('Error: Unknown user %r.' % target)
+        irc.error('Unknown user %r.' % target)
         return
 
     f = lambda s: irc.reply(s, private=True)
@@ -65,13 +81,14 @@ def showchan(irc, source, args):
     """<channel>
 
     Shows information about <channel>."""
+    permissions.checkPermissions(irc, source, ['commands.showchan'])
     try:
         channel = irc.toLower(args[0])
     except IndexError:
-        irc.reply("Error: Not enough arguments. Needs 1: channel.")
+        irc.error("Not enough arguments. Needs 1: channel.")
         return
     if channel not in irc.channels:
-        irc.reply('Error: Unknown channel %r.' % channel)
+        irc.error('Unknown channel %r.' % channel)
         return
 
     f = lambda s: irc.reply(s, private=True)
@@ -82,7 +99,7 @@ def showchan(irc, source, args):
     secret = ('s', None) in c.modes
     if secret and not verbose:
         # Hide secret channels from normal users.
-        irc.reply('Error: Unknown channel %r.' % channel, private=True)
+        irc.error('Unknown channel %r.' % channel, private=True)
         return
 
     nicks = [irc.users[u].nick for u in c.users]
@@ -125,7 +142,56 @@ def echo(irc, source, args):
     """<text>
 
     Echoes the text given."""
+    permissions.checkPermissions(irc, source, ['commands.echo'])
     irc.reply(' '.join(args))
+
+def _check_logout_access(irc, source, target, perms):
+    """
+    Checks whether the source UID has access to log out the target UID.
+    This returns True if the source user has a permission specified,
+    or if the source and target are both logged in and have the same account.
+    """
+    assert source in irc.users, "Unknown source user"
+    assert target in irc.users, "Unknown target user"
+    try:
+        permissions.checkPermissions(irc, source, perms)
+    except utils.NotAuthorizedError:
+        if irc.users[source].account and (irc.users[source].account == irc.users[target].account):
+            return True
+        else:
+            raise
+    else:
+        return True
+
+@utils.add_cmd
+def logout(irc, source, args):
+    """[<other nick/UID>]
+
+    Logs your account out of PyLink. If you have the 'commands.logout.force' permission, or are
+    attempting to log out yourself, you can also specify a nick to force a logout for."""
+
+    try:
+        othernick = args[0]
+    except IndexError:  # No user specified
+        if irc.users[source].account:
+            irc.users[source].account = ''
+        else:
+            irc.error("You are not logged in!")
+            return
+    else:
+        otheruid = irc.nickToUid(othernick)
+        if not otheruid:
+            irc.error("Unknown user %s." % othernick)
+            return
+        else:
+            _check_logout_access(irc, source, otheruid, ['commands.logout.force'])
+            if irc.users[otheruid].account:
+                irc.users[otheruid].account = ''
+            else:
+                irc.error("%s is not logged in." % othernick)
+                return
+
+    irc.reply("Done.")
 
 loglevels = {'DEBUG': 10, 'INFO': 20, 'WARNING': 30, 'ERROR': 40, 'CRITICAL': 50}
 @utils.add_cmd
@@ -134,16 +200,37 @@ def loglevel(irc, source, args):
 
     Sets the log level to the given <level>. <level> must be either DEBUG, INFO, WARNING, ERROR, or CRITICAL.
     If no log level is given, shows the current one."""
-    irc.checkAuthenticated(source, allowOper=False)
+    permissions.checkPermissions(irc, source, ['commands.loglevel'])
     try:
         level = args[0].upper()
         try:
             loglevel = loglevels[level]
         except KeyError:
-            irc.reply('Error: Unknown log level "%s".' % level)
+            irc.error('Unknown log level "%s".' % level)
             return
         else:
             world.stdout_handler.setLevel(loglevel)
             irc.reply("Done.")
     except IndexError:
         irc.reply(world.stdout_handler.level)
+
+@utils.add_cmd
+def mkpasswd(irc, source, args):
+    """<password>
+    Hashes a password for use in the configuration file."""
+    # TODO: restrict to only certain users?
+    try:
+        password = args[0]
+    except IndexError:
+        irc.error("Not enough arguments. (Needs 1, password)")
+        return
+    if not password:
+        irc.error("Password cannot be empty.")
+        return
+
+    if not pwd_context:
+        irc.error("Password encryption is not available (missing passlib).")
+        return
+
+    hashed_pass = pwd_context.encrypt(password)
+    irc.reply(hashed_pass, private=True)

@@ -1,6 +1,6 @@
 import time
-import string
 import threading
+import base64
 
 from pylinkirc import utils, conf
 from pylinkirc.log import log
@@ -8,6 +8,7 @@ from pylinkirc.classes import Protocol, IrcUser, IrcServer
 
 FALLBACK_REALNAME = 'PyLink Relay Mirror Client'
 COMMON_PREFIXMODES = [('h', 'halfop'), ('a', 'admin'), ('q', 'owner'), ('y', 'owner')]
+IRCV3_CAPABILITIES = {'multi-prefix', 'sasl'}
 
 class ClientbotWrapperProtocol(Protocol):
     def __init__(self, irc):
@@ -22,6 +23,8 @@ class ClientbotWrapperProtocol(Protocol):
         self.casemapping = 'ascii'
 
         self.caps = {}
+        self.ircv3_caps = set()
+        self.ircv3_caps_available = {}
 
         # Initialize counter-based pseudo UID  generators
         self.uidgen = utils.PUIDGenerator('PUID')
@@ -54,7 +57,7 @@ class ClientbotWrapperProtocol(Protocol):
         """Initializes a connection to a server."""
         self.has_eob = False
         ts = self.irc.start_ts
-        f = self.irc.send
+        f = lambda text: self.irc.send(text, queue=False)
 
         # Enumerate our own server
         self.irc.sid = self.sidgen.next_sid()
@@ -62,6 +65,9 @@ class ClientbotWrapperProtocol(Protocol):
         # Clear states from last connect
         self.who_received.clear()
         self.kick_queue.clear()
+        self.caps.clear()
+        self.ircv3_caps.clear()
+        self.ircv3_caps_available.clear()
 
         sendpass = self.irc.serverdata.get("sendpass")
         if sendpass:
@@ -75,6 +81,8 @@ class ClientbotWrapperProtocol(Protocol):
         ident = self.irc.serverdata.get('pylink_ident') or conf.conf["bot"].get("ident", "pylink")
         f('USER %s 8 * :%s' % (ident, # TODO: per net realnames or hostnames aren't implemented yet.
                               conf.conf["bot"].get("realname", "PyLink Clientbot")))
+
+        f('CAP LS 302')
 
     # Note: clientbot clients are initialized with umode +i by default
     def spawnClient(self, nick, ident='unknown', host='unknown.host', realhost=None, modes={('i', None)},
@@ -90,7 +98,7 @@ class ClientbotWrapperProtocol(Protocol):
         ts = ts or int(time.time())
 
         log.debug('(%s) spawnClient stub called, saving nick %s as PUID %s', self.irc.name, nick, uid)
-        u = self.irc.users[uid] = IrcUser(nick, ts, uid, ident=ident, host=host, realname=realname,
+        u = self.irc.users[uid] = IrcUser(nick, ts, uid, server, ident=ident, host=host, realname=realname,
                                           manipulatable=manipulatable, realhost=realhost, ip=ip)
         self.irc.servers[server].users.add(uid)
 
@@ -131,7 +139,8 @@ class ClientbotWrapperProtocol(Protocol):
         # rely on the /NAMES reply to sync it up properly.
         if self.irc.pseudoclient and client == self.irc.pseudoclient.uid:
             self.irc.send('JOIN %s' % channel)
-            # Send a /who request right after
+            # Send /names and /who requests right after
+            self.irc.send('NAMES %s' % channel)
             self.irc.send('WHO %s' % channel)
         else:
             self.irc.channels[channel].users.add(client)
@@ -181,6 +190,35 @@ class ClientbotWrapperProtocol(Protocol):
             self.irc.send('%s %s :%s' % (command, self._expandPUID(target), text))
         else:
             self.irc.callHooks([source, 'CLIENTBOT_MESSAGE', {'target': target, 'is_notice': notice, 'text': text}])
+
+    def mode(self, source, channel, modes, ts=None):
+        """Sends channel MODE changes."""
+        if utils.isChannel(channel):
+            extmodes = []
+            # Re-parse all channel modes locally to eliminate anything invalid, such as unbanning
+            # things that were never banned. This prevents the bot from getting caught in a loop
+            # with IRCd MODE acknowledgements.
+            # FIXME: More related safety checks should be added for this.
+            log.debug('(%s) mode: re-parsing modes %s', self.irc.name, modes)
+            joined_modes = self.irc.joinModes(modes)
+            for modepair in self.irc.parseModes(channel, joined_modes):
+                log.debug('(%s) mode: checking if %s a prefix mode: %s', self.irc.name, modepair, self.irc.prefixmodes)
+                if modepair[0][-1] in self.irc.prefixmodes:
+                    if self.irc.isInternalClient(modepair[1]):
+                        # Ignore prefix modes for virtual internal clients.
+                        log.debug('(%s) mode: skipping virtual client prefixmode change %s', self.irc.name, modepair)
+                        continue
+                    else:
+                        # For other clients, change the mode argument to nick instead of PUID.
+                        nick = self.irc.getFriendlyName(modepair[1])
+                        log.debug('(%s) mode: coersing mode %s argument to %s', self.irc.name, modepair, nick)
+                        modepair = (modepair[0], nick)
+                extmodes.append(modepair)
+
+            log.debug('(%s) mode: filtered modes for %s: %s', self.irc.name, channel, extmodes)
+            if extmodes:
+                self.irc.send('MODE %s %s' % (channel, self.irc.joinModes(extmodes)))
+                # Don't update the state here: the IRCd sill respond with a MODE reply if successful.
 
     def nick(self, source, newnick):
         """STUB: Sends NICK changes."""
@@ -253,7 +291,7 @@ class ClientbotWrapperProtocol(Protocol):
     def _stub(self, *args):
         """Stub outgoing command function (does nothing)."""
         return
-    kill = mode = topic = topicBurst = knock = numeric = _stub
+    kill = topic = topicBurst = knock = numeric = _stub
 
     def updateClient(self, target, field, text):
         """Updates the known ident, host, or realname of a client."""
@@ -283,7 +321,7 @@ class ClientbotWrapperProtocol(Protocol):
         else:
             return  # Nothing changed
 
-    def _getUid(self, nick, ident='unknown', host='unknown.host'):
+    def _getUid(self, nick, ident=None, host=None):
         """
         Fetches the UID for the given nick, creating one if it does not already exist.
 
@@ -300,13 +338,41 @@ class ClientbotWrapperProtocol(Protocol):
                 log.debug('(%s) Nick-colliding virtual client %s/%s', self.irc.name, idsource, nick)
                 self.irc.callHooks([self.irc.sid, 'CLIENTBOT_NICKCOLLIDE', {'target': idsource, 'parse_as': 'SAVE'}])
 
-            idsource = self.spawnClient(nick, ident, host, server=self.irc.uplink, realname=FALLBACK_REALNAME).uid
+            idsource = self.spawnClient(nick, ident or 'unknown', host or 'unknown',
+                                        server=self.irc.uplink, realname=FALLBACK_REALNAME).uid
 
         return idsource
+
+    def parseMessageTags(self, data):
+        """
+        Parses a message with IRC v3.2 message tags, as described at http://ircv3.net/specs/core/message-tags-3.2.html
+        """
+        # Example query:
+        # @aaa=bbb;ccc;example.com/ddd=eee :nick!ident@host.com PRIVMSG me :Hello
+        if data[0].startswith('@'):
+            tagdata = data[0].lstrip('@').split(';')
+            for idx, tag in enumerate(tagdata):
+                tag = tag.replace(r'\s', ' ')
+                tag = tag.replace(r'\\', '\\')
+                tag = tag.replace(r'\r', '\r')
+                tag = tag.replace(r'\n', '\n')
+                tag = tag.replace(r'\:', ';')
+                tagdata[idx] = tag
+
+            results = self.parseCapabilities(tagdata, fallback=None)
+            log.debug('(%s) parsed message tags %s', self.irc.name, results)
+            return results
+        return {}
 
     def handle_events(self, data):
         """Event handler for the RFC1459/2812 (clientbot) protocol."""
         data = data.split(" ")
+
+        tags = self.parseMessageTags(data)
+        if tags:
+            # If we have tags, split off the first argument.
+            data = data[1:]
+
         try:
             args = self.parsePrefixedArgs(data)
             sender = args[0]
@@ -320,17 +386,21 @@ class ClientbotWrapperProtocol(Protocol):
             command = args[0]
             args = args[1:]
         else:
-            # PyLink as a services framework expects UIDs and SIDs for everythiung. Since we connect
+            # PyLink as a services framework expects UIDs and SIDs for everything. Since we connect
             # as a bot here, there's no explicit user introduction, so we're going to generate
             # pseudo-uids and pseudo-sids as we see prefixes.
-            if '!' not in sender:
-                # Sender is a server name.
+            if ('!' not in sender) and '.' in sender:
+                # Sender is a server name. XXX: make this check more foolproof
                 idsource = self._getSid(sender)
                 if idsource not in self.irc.servers:
                     idsource = self.spawnServer(sender, internal=False)
             else:
-                # Sender is a nick!user@host prefix. Split it into its relevant parts.
-                nick, ident, host = utils.splitHostmask(sender)
+                # Sender is a either a nick or a nick!user@host prefix. Split it into its relevant parts.
+                try:
+                    nick, ident, host = utils.splitHostmask(sender)
+                except ValueError:
+                    ident = host = None  # Set ident and host as null for now.
+                    nick = sender  # Treat the sender prefix we received as a nick.
                 idsource = self._getUid(nick, ident, host)
 
         try:
@@ -340,7 +410,145 @@ class ClientbotWrapperProtocol(Protocol):
         else:
             parsed_args = func(idsource, command, args)
             if parsed_args is not None:
+                parsed_args['tags'] = tags  # Add message tags to this dict.
                 return [idsource, command, parsed_args]
+
+    def saslAuth(self):
+        """
+        Starts an authentication attempt via SASL. This returns True if SASL
+        is enabled and correctly configured, and False otherwise.
+        """
+        if 'sasl' not in self.ircv3_caps:
+            log.info("(%s) Skipping SASL auth since the IRCd doesn't support it.", self.irc.name)
+            return
+
+        sasl_mech = self.irc.serverdata.get('sasl_mechanism')
+        if sasl_mech:
+            sasl_mech = sasl_mech.upper()
+            sasl_user = self.irc.serverdata.get('sasl_username')
+            sasl_pass = self.irc.serverdata.get('sasl_password')
+            ssl_cert = self.irc.serverdata.get('ssl_certfile')
+            ssl_key = self.irc.serverdata.get('ssl_keyfile')
+            ssl = self.irc.serverdata.get('ssl')
+
+            if sasl_mech == 'PLAIN':
+                if not (sasl_user and sasl_pass):
+                    log.warning("(%s) Not attempting PLAIN authentication; sasl_username and/or "
+                                "sasl_password aren't correctly set.", self.irc.name)
+                    return False
+            elif sasl_mech == 'EXTERNAL':
+                if not ssl:
+                    log.warning("(%s) Not attempting EXTERNAL authentication; SASL external requires "
+                                "SSL, but it isn't enabled.", self.irc.name)
+                    return False
+                elif not (ssl_cert and ssl_key):
+                    log.warning("(%s) Not attempting EXTERNAL authentication; ssl_certfile and/or "
+                                "ssl_keyfile aren't correctly set.", self.irc.name)
+                    return False
+            else:
+                log.warning('(%s) Unsupported SASL mechanism %s; aborting SASL.', self.irc.name, sasl_mech)
+                return False
+            self.irc.send('AUTHENTICATE %s' % sasl_mech, queue=False)
+            return True
+        return False
+
+    def sendAuthChunk(self, data):
+        """Send Base64 encoded SASL authentication chunks."""
+        enc_data = base64.b64encode(data).decode()
+        self.irc.send('AUTHENTICATE %s' % enc_data, queue=False)
+
+    def handle_authenticate(self, source, command, args):
+        """
+        Handles AUTHENTICATE, or SASL authentication requests from the server.
+        """
+        # Client: AUTHENTICATE PLAIN
+        # Server: AUTHENTICATE +
+        # Client: AUTHENTICATE ...
+        if not args:
+            return
+        if args[0] == '+':
+            sasl_mech = self.irc.serverdata['sasl_mechanism'].upper()
+            if sasl_mech == 'PLAIN':
+                sasl_user = self.irc.serverdata['sasl_username']
+                sasl_pass = self.irc.serverdata['sasl_password']
+                authstring = '%s\0%s\0%s' % (sasl_user, sasl_user, sasl_pass)
+                self.sendAuthChunk(authstring.encode('utf-8'))
+            elif sasl_mech == 'EXTERNAL':
+                self.irc.send('AUTHENTICATE +')
+
+    def handle_904(self, source, command, args):
+        """
+        Handles SASL authentication status reports.
+        """
+        logfunc = log.info if command == '903' else log.warning
+        logfunc('(%s) %s', self.irc.name, args[-1])
+        if not self.has_eob:
+            self.irc.send('CAP END')
+    handle_903 = handle_902 = handle_905 = handle_906 = handle_907 = handle_904
+
+    def requestNewCaps(self):
+        # Filter the capabilities we want by the ones actually supported by the server.
+        available_caps = {cap for cap in IRCV3_CAPABILITIES if cap in self.ircv3_caps_available}
+        # And by the ones we don't already have.
+        caps_wanted = available_caps - self.ircv3_caps
+
+        log.debug('(%s) Requesting IRCv3 capabilities %s (available: %s)', self.irc.name, caps_wanted, available_caps)
+        if caps_wanted:
+            self.irc.send('CAP REQ :%s' % ' '.join(caps_wanted), queue=False)
+
+    def handle_cap(self, source, command, args):
+        """
+        Handles IRCv3 capabilities transmission.
+        """
+        subcmd = args[1]
+
+        if subcmd == 'LS':
+            # Server: CAP * LS * :multi-prefix extended-join account-notify batch invite-notify tls
+            # Server: CAP * LS * :cap-notify server-time example.org/dummy-cap=dummyvalue example.org/second-dummy-cap
+            # Server: CAP * LS :userhost-in-names sasl=EXTERNAL,DH-AES,DH-BLOWFISH,ECDSA-NIST256P-CHALLENGE,PLAIN
+            log.debug('(%s) Got new capabilities %s', self.irc.name, args[-1])
+            self.ircv3_caps_available.update(self.parseCapabilities(args[-1], None))
+            if args[2] != '*':
+                self.requestNewCaps()
+
+        elif subcmd == 'ACK':
+            # Server: CAP * ACK :multi-prefix sasl
+            newcaps = set(args[-1].split())
+            log.debug('(%s) Received ACK for IRCv3 capabilities %s', self.irc.name, newcaps)
+            self.ircv3_caps |= newcaps
+
+            # Only send CAP END immediately if SASL is disabled. Otherwise, wait for the 90x responses
+            # to do so.
+            if not self.saslAuth():
+                if not self.has_eob:
+                    self.irc.send('CAP END')
+        elif subcmd == 'NAK':
+            log.warning('(%s) Got NAK for IRCv3 capabilities %s, even though they were supposedly available',
+                        self.irc.name, args[-1])
+            if not self.has_eob:
+                self.irc.send('CAP END')
+        elif subcmd == 'NEW':
+            # :irc.example.com CAP modernclient NEW :batch
+            # :irc.example.com CAP tester NEW :away-notify extended-join
+            # Note: CAP NEW allows capabilities with values (e.g. sasl=mech1,mech2), while CAP DEL
+            # does not.
+            log.debug('(%s) Got new capabilities %s', self.irc.name, args[-1])
+            newcaps = self.parseCapabilities(args[-1], None)
+            self.ircv3_caps_available.update(newcaps)
+            self.requestNewCaps()
+
+            # Attempt SASL auth routines when sasl is added/removed, if doing so is enabled.
+            if 'sasl' in newcaps and self.irc.serverdata.get('sasl_reauth'):
+                log.debug('(%s) Attempting SASL reauth due to CAP NEW', self.irc.name)
+                self.saslAuth()
+
+        elif subcmd == 'DEL':
+            # :irc.example.com CAP modernclient DEL :userhost-in-names multi-prefix away-notify
+            log.debug('(%s) Removing capabilities %s', self.irc.name, args[-1])
+            for cap in args[-1].split():
+                # Remove the capabilities from the list available, and return None (ignore) if any fail
+                self.ircv3_caps_available.pop(cap, None)
+                self.ircv3_caps.discard(cap)
 
     def handle_001(self, source, command, args):
         """
@@ -427,7 +635,7 @@ class ClientbotWrapperProtocol(Protocol):
             if (idsource not in self.irc.channels[channel].users) or (idsource in \
                     self.kick_queue.get(channel, ([],))[0]):
                 names.add(idsource)
-                self.irc.users[idsource].channels.add(channel)
+            self.irc.users[idsource].channels.add(channel)
 
             # Process prefix modes
             for char in name:
@@ -492,16 +700,17 @@ class ClientbotWrapperProtocol(Protocol):
         else:
             log.warning('(%s) handle_352: got wrong string %s for away status', self.irc.name, status[0])
 
-        if '*' in status:  # Track IRCop status
-            if not self.irc.isOper(uid, allowAuthed=False):
-                # Don't send duplicate oper ups if the target is already oper.
-                self.irc.applyModes(uid, [('+o', None)])
-                self.irc.callHooks([uid, 'MODE', {'target': uid, 'modes': {('+o', None)}}])
-                self.irc.callHooks([uid, 'CLIENT_OPERED', {'text': 'IRC Operator'}])
-        elif self.irc.isOper(uid, allowAuthed=False) and not self.irc.isInternalClient(uid):
-            # Track deopers
-            self.irc.applyModes(uid, [('-o', None)])
-            self.irc.callHooks([uid, 'MODE', {'target': uid, 'modes': {('-o', None)}}])
+        if self.irc.serverdata.get('track_oper_statuses'):
+            if '*' in status:  # Track IRCop status
+                if not self.irc.isOper(uid, allowAuthed=False):
+                    # Don't send duplicate oper ups if the target is already oper.
+                    self.irc.applyModes(uid, [('+o', None)])
+                    self.irc.callHooks([uid, 'MODE', {'target': uid, 'modes': {('+o', None)}}])
+                    self.irc.callHooks([uid, 'CLIENT_OPERED', {'text': 'IRC Operator'}])
+            elif self.irc.isOper(uid, allowAuthed=False) and not self.irc.isInternalClient(uid):
+                # Track deopers
+                self.irc.applyModes(uid, [('-o', None)])
+                self.irc.callHooks([uid, 'MODE', {'target': uid, 'modes': {('-o', None)}}])
 
         self.who_received.add(uid)
 
@@ -515,9 +724,23 @@ class ClientbotWrapperProtocol(Protocol):
         self.who_received.clear()
 
         channel = self.irc.toLower(args[1])
-        self.irc.channels[channel].who_received = True
+        c = self.irc.channels[channel]
+        c.who_received = True
 
-        return {'channel': channel, 'users': users, 'modes': self.irc.channels[channel].modes,
+        modes = set(c.modes)
+        for user in users:
+            # Fill in prefix modes of everyone when doing mock SJOIN.
+            try:
+                for mode in c.getPrefixModes(user):
+                    modechar = self.irc.cmodes.get(mode)
+                    log.debug('(%s) handle_315: adding mode %s +%s %s', self.irc.name, mode, modechar, user)
+                    if modechar:
+                        modes.add((modechar, user))
+            except KeyError as e:
+                log.debug("(%s) Ignoring KeyError (%s) from WHO response; it's probably someone we "
+                          "don't share any channels with", self.irc.name, e)
+
+        return {'channel': channel, 'users': users, 'modes': modes,
                 'parse_as': "JOIN"}
 
     def handle_433(self, source, command, args):
@@ -564,8 +787,20 @@ class ClientbotWrapperProtocol(Protocol):
                 self.kick_queue[channel][1].cancel()
                 del self.kick_queue[channel]
 
-        self.handle_part(target, 'KICK', [channel, reason])
-        return {'channel': channel, 'target': target, 'text': reason}
+        # Statekeeping: remove the target from the channel they were previously in.
+        self.irc.channels[channel].removeuser(target)
+        try:
+            self.irc.users[target].channels.remove(channel)
+        except KeyError:
+            pass
+
+        if (not self.irc.isInternalClient(source)) and not self.irc.isInternalServer(source):
+            # Don't repeat hooks if we're the kicker.
+            self.irc.callHooks([source, 'KICK', {'channel': channel, 'target': target, 'text': reason}])
+
+        # Delete channels that we were kicked from, for better state keeping.
+        if self.irc.pseudoclient and target == self.irc.pseudoclient.uid:
+            del self.irc.channels[channel]
 
     def handle_mode(self, source, command, args):
         """Handles MODE changes."""
@@ -585,7 +820,12 @@ class ClientbotWrapperProtocol(Protocol):
         if self.irc.isInternalClient(target):
             log.debug('(%s) Suppressing MODE change hook for internal client %s', self.irc.name, target)
             return
-        return {'target': target, 'modes': changedmodes, 'channeldata': oldobj}
+        if changedmodes:
+            # Prevent infinite loops: don't send MODE hooks if the sender is US.
+            # Note: this is not the only check in Clientbot to prevent mode loops: if our nick
+            # somehow gets desynced, this may not catch everything it's supposed to.
+            if (self.irc.pseudoclient and source != self.irc.pseudoclient.uid) or not self.irc.pseudoclient:
+                return {'target': target, 'modes': changedmodes, 'channeldata': oldobj}
 
     def handle_nick(self, source, command, args):
         """Handles NICK changes."""
@@ -623,7 +863,12 @@ class ClientbotWrapperProtocol(Protocol):
             self.irc.channels[channel].removeuser(source)
         self.irc.users[source].channels -= set(channels)
 
-        return {'channels': channels, 'text': reason}
+        self.irc.callHooks([source, 'PART', {'channels': channels, 'text': reason}])
+
+        # Clear channels that are empty, or that we're parting.
+        for channel in channels:
+            if (self.irc.pseudoclient and source == self.irc.pseudoclient.uid) or not self.irc.channels[channel].users:
+                del self.irc.channels[channel]
 
     def handle_ping(self, source, command, args):
         """

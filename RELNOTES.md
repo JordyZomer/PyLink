@@ -1,3 +1,85 @@
+# PyLink 1.1.0
+
+The "Calico" release. This is mostly a cleanup and documentation update from 1.1-beta2, with the following additional change:
+- Made passlib an optional dependency (password hashing will be disabled if passlib isn't installed), simplifying the upgrade process.
+
+For a full list of changes since 1.0.x, see the release notes for the 1.1 alpha & beta series. Summary of major changes since 1.0.x:
+
+- :closed_lock_with_key: **Redone authentication configuration**, now supporting **multiple accounts**, hashed passwords, and fine-tuned permissions.
+   - Old configurations using `login:user` and `login:password` will still work, but are now deprecated. Consider migrating to the new `login:` block in the example config.
+   - This also adds a new optional dependency of passlib (https://passlib.readthedocs.io/en/stable/), which is required for the password hashing portion.
+- Protocol modules now wrap long messages (SJOIN and MODE) to prevent cutoff shenanigans from happening.
+   - This fixes a particularly nasty bug that can corrupt the TS on UnrealIRCd channels if a MODE command sets more than 12 modes at once (#393).
+- Added utilities to download contrib modules (`pylink-contribdl`) and hash passwords for the new accounts configuration (`pylink-mkpasswd`).
+- Most plugins were ported to the permissions API.
+- Clientbot now supports mode syncing, SASL (with optional reauth), and IRCv3 multi-prefix.
+- Services bots now support setting modes on themselves on join: see "joinmodes" in the example conf
+- Changehost gained a few new features, including optional (per network) vHost enforcement.
+- Added a `bindhost` option in server blocks, for multi-homed hosts.
+- PID file checking was implemented - Run PyLink with the `--check-pid` argument in order to turn it on.
+- The `ts6` protocol module now supports `KICK` without arguments and legacy `UID` introduction (for older servers / services).
+- Relay: added a `purge` command to remove all relays involving a network.
+- Added support for ircd-ratbox (`ratbox` protocol module).
+- Changing the console log level via REHASH now works.
+- New `servermaps` plugin, displaying network `/map`'s from the PyLink server's perspective.
+
+# PyLink 1.1-beta2
+
+The "Conscience" release. Changes from 1.1-beta1:
+
+#### Bug fixes
+
+- Protocol modules now wrap longer messages (SJOIN and MODE) to prevent cutoff shenanigans from happening.
+    - This fixes a particularly nasty bug that can corrupt the TS on UnrealIRCd channels if a MODE command sets more than 12 modes at once (#393).
+- Pong handling is a lot less strict now (it just makes sure the sender is the uplink). In other words, fix issues on UnrealIRCd where PONGs get ignored if the argument doesn't match the server name exactly (e.g. different case).
+- Clientbot protocol fixes:
+    - Fix SASL PLAIN auth on Python 3.4 (TypeError with bytes formatting with `%b`).
+    - Don't repeat KICK hooks if the source is internal: this prevents KICK events from being relayed twice to Clientbot links, when the kicked user is also a Clientbot user.
+    - Clientbot now explicitly sends `/names` after join, to guarantee a response.
+    - Fix message recognition treating nick prefixes without `ident@host` as servers (this polluted the state)
+    - Fix prefix mode changes for unknown/missing users in `/who` causing KeyError crashes
+- ts6: fix setting mode `-k *` not working due to wrongly ordered logic (1.1-dev regression)
+- ts6: fix handling of KICK without a reason argument
+- Automode: remove some repeated "Error:" text in error messages
+- `IrcChannel` no longer assumes `+nt` on new channels, as this is not necessarily correct
+
+#### Feature changes
+- Changing the console log level via REHASH is now supported.
+- Added a bind host option for multi-homed hosts.
+
+#### Internal improvements
+- updateTS now ignores any broken TS values lower than 750000, instead of propagating them (e.g. over relay) and making the problem worse.
+- The UnrealIRCd protocol module was updated to actually use extended SJOIN (SJ3). This should make bursts/startup more efficient, as modes, users, and bans are now sent together.
+
+# PyLink 1.1-beta1
+
+The "Crunchy" release. This release includes all bug fixes from PyLink 1.0.4, along with the following:
+
+### Changes from 1.1-alpha1
+
+#### Feature changes
+- Most plugins were ported to use the permissions API, meaning multiple accounts are actually useful now!
+    - Having a **PyLink login** with *new* style accounts **no longer implies access to everything** on the PyLink daemon. See the updated example conf regarding the new `permissions:` block.
+    - **Logins implying admin access** is limited to **old accounts ONLY** (i.e. logins defined via login:user/password)
+    - The `commands` plugin now has permissions checks for `echo`, `showuser`, `showchan`, and `status`. The latter three are granted to all users (`*!*@*`) by default, while `echo` is restricted.
+- Clientbot now supports IRCv3 SASL (with optional reauth!) and multi-prefix. See the example conf for details on the former (the latter is enabled automatically when available).
+- PID file checking is now **disabled** by default for better migration from 1.0.x. Run PyLink with `--check-pid` in order to turn it on.
+- commands: add a new `logout` command (#370)
+- The `list` command now supports optionally filtering commands by plugin.
+
+#### Bug fixes
+- The permission to use servermaps is now `servermaps.map` instead of `servermap.map`.
+- networks: fix the `remote` command to work with permissions (i.e. override the correct account name)
+- relay: add missing permissions check on the `linked` command
+
+#### Internal fixes / improvements
+- relay: rewrite host normalization to whitelist instead of blacklist characters. This should improve compatibility with IRCds as previously untested characters are introduced.
+- relay_clientbot: faster colour hashing using built-in `hash()` instead of md5
+- opercmds: removed the source argument from `kick` and `kill`; it's confusing and isn't very useful
+
+#### Misc. changes
+- Documentation updates: add a permissions reference, document advanced relay config, etc.
+
 # PyLink 1.0.4
 Tagged as **1.0.4** by [GLolol](https://github.com/GLolol)
 
@@ -13,6 +95,65 @@ The "Bonfire" release.
 
 #### Misc changes
 - networks: update help for `disconnect` to reflect how it now always disables autoconnect.
+
+# PyLink 1.1-alpha1
+
+The "Candescent" release.
+
+### Changes from 1.0.3
+
+#### Feature changes
+- **Clientbot now supports optional mode syncing** :tada: See the example conf for how to configure it (look for "modesync").
+- PID file checking has been implemented and is turned on by default. :warning: **When upgrading from 1.0.x, remove `pylink.pid` before starting!**
+- Revamped login configuration system, which now supports **multiple accounts and hashed passwords**
+    - :warning: `login:user` and `login:password` are now deprecated and may be removed in a future release. Consider migrating to the new `login:` block in the example config.
+    - Hashing new passwords can be done using the `mkpasswd` command via IRC, or the new command line utility `pylink-mkpasswd`.
+- Services bots now support setting modes on themselves on join: see "joinmodes" in the example conf
+- Added a contrib module downloader (`pylink-contribdl`)
+- Relay now uses the PyLink permission system. The following permissions are now available:
+	- Granted to opers by default:
+		- `relay.create`
+		- `relay.destroy`
+		- `relay.claim`
+		- `relay.link`
+		- `relay.delink`
+		- `relay.linkacl.view`
+		- `relay.linkacl`
+	- Granted to all users by default:
+		- `relay.linked`
+	- And the following which is not explicitly granted:
+		- `relay.savedb`
+- Relay: added a `purge` command to remove all relays involving a network
+- Automode now supports remote channel manipulation in the form `netname#channel` (#352)
+- protocols/ts6 now supports legacy UID introduction, for older servers / services
+- Changehost gained a few new features (look for "changehost:" in the example conf):
+    - Optional (per network) vHost enforcement: now you can create spoofs like freenode without using their IRCd!
+    - Enforcement exceptions for the feature above
+    - Options to enable/disable matching users by IP and real host
+- New protocol support for `ircd-ratbox`, based off `ts6`
+- New servermaps plugin, displaying network `/map`'s from the PyLink server's perspective. Relay links can be expanded as well to make this more detailed!
+- Oper status tracking is now a network-specific option, for better security. Look for "track_oper_statuses" in the example config.
+- The PyLink launcher now sets the terminal title on launch (Windows & POSIX)
+- relay: implement a complementary `showchan` command, showing a list of relay links
+
+#### Bug fixes
+- Relay is potentially less crashy when PyLink is split off while it tries to introduce users (#354).
+- The `bots` plugin now allows JOIN/NICK/PART on all service bots
+- Relay: skip channel TS check for Clientbot (some users had this as a sporadic issue)
+- Irc: explicitly kill connect loop threads after an Irc object has been removed. This fixes various freezing issues caused by ghosted connections after a network splits (#351).
+- Relay: don't error when removing a channel from a network that isn't connected. (AttributeError on `removeChannel()` if `irc.pseudoclient` isn't set)
+
+#### Internal fixes / improvements
+- Server ID and service client name (if applicable) are now stored inside `IrcUser` objects, removing the need for some expensive reverse lookups
+- Relay and Automode now use a centralized DataStore (backwards compatible) in `structures` for their database implementation
+- Docstring rewrapping is now supported for neater, wrappable docstrings! (#307)
+- `Irc.error()` was added for easier error replies; it is a simple wrapper around `Irc.reply()`
+- Relay now uses locks in DB read/writes, for thread safety
+- Most camel case functions in Relay were renamed to lowercase with underscores (PEP 8)
+
+#### Misc. changes
+- exec: Drop `raw` text logging to DEBUG to prevent information leakage (e.g. passwords on Clientbot)
+- Removed `update.sh` (my convenience script for locally building + running PyLink)
 
 # [PyLink 1.0.3](https://github.com/GLolol/PyLink/releases/tag/1.0.3)
 Tagged as **1.0.3** by [GLolol](https://github.com/GLolol) on 2016-11-20T04:51:11Z

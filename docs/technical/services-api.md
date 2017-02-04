@@ -26,7 +26,6 @@ myservice = utils.registerService("myservice", desc=desc)
 - `default_list` - Determines whether the default LIST command should be used for the service. Defaults to True.
 - `nick`, `ident` - Sets the default nick and ident for the service bot. If not given, these simply default to the service name.
 - `manipulatable` - Determines whether the bot is marked manipulatable. Only manipulatable clients can be force joined, etc. using PyLink commands. Defaults to False.
-- `extra_channels` - Defines a dict mapping network names to a set of channels that the bot should autojoin on that network.
 - `desc` - Sets the command description of the service. This is shown in the default HELP command if enabled.
 
 ### Getting the UID of a bot
@@ -35,9 +34,9 @@ Should you want to get the UID of a service bot on a specific server, use `myser
 
 ### Setting channels to join
 
-All services bots wil automatically join the autojoin channels configured for a specific network, if any.
+All services bots will automatically join the autojoin channels configured for a specific network, if any.
 
-However, plugins can modify the autojoin entries of a specific bot by adding items to the `myservice.extra_channels` channel set. After sending `irc.proto.join(...)` using the service bot's UID as a source, the bot should permanently remain on that channel throughout KILLs or disconnects.
+However, plugins can persistently join services bots to specific channels by calling `myservice.join(irc, channels)`. To manually add/remove channels from the service's autojoin list, modify the `myservice.extra_channels` set.
 
 ## Removing services on unload
 

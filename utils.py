@@ -16,6 +16,10 @@ from . import world, conf
 # This is just so protocols and plugins are importable.
 from pylinkirc import protocols, plugins
 
+PLUGIN_PREFIX = 'pylinkirc.plugins.'
+PROTOCOL_PREFIX = 'pylinkirc.protocols.'
+NORMALIZEWHITESPACE_RE = re.compile(r'\s+')
+
 class NotAuthorizedError(Exception):
     """
     Exception raised by checkAuthenticated() when a user fails authentication
@@ -138,25 +142,17 @@ def applyModes(irc, target, changedmodes):
     log.warning("(%s) utils.applyModes is deprecated. Use irc.applyModes() instead!", irc.name)
     return irc.applyModes(target, changedmodes)
 
-def loadModuleFromFolder(name, folder):
-    """
-    Imports and returns a module, if existing, from a specific folder.
-    """
-    fullpath = os.path.join(folder, '%s.py' % name)
-    m = importlib.machinery.SourceFileLoader(name, fullpath).load_module()
-    return m
-
 def loadPlugin(name):
     """
     Imports and returns the requested plugin.
     """
-    return importlib.import_module('pylinkirc.plugins.' + name)
+    return importlib.import_module(PLUGIN_PREFIX + name)
 
 def getProtocolModule(name):
     """
     Imports and returns the protocol module requested.
     """
-    return importlib.import_module('pylinkirc.protocols.' + name)
+    return importlib.import_module(PROTOCOL_PREFIX + name)
 
 def getDatabaseName(dbname):
     """
@@ -186,10 +182,12 @@ class ServiceBot():
     """
 
     def __init__(self, name, default_help=True, default_list=True,
-                 nick=None, ident=None, manipulatable=False, extra_channels=None,
-                 desc=None):
+                 nick=None, ident=None, manipulatable=False, desc=None):
         # Service name
         self.name = name
+
+        # TODO: validate nick, ident, etc. on runtime as well
+        assert isNick(name), "Invalid service name %r" % name
 
         # Nick/ident to take. Defaults to the same as the service name if not given.
         self.nick = nick
@@ -209,7 +207,7 @@ class ServiceBot():
 
         # Track what channels other than those defined in the config
         # that the bot should join by default.
-        self.extra_channels = extra_channels or collections.defaultdict(set)
+        self.extra_channels = collections.defaultdict(set)
 
         # Service description, used in the default help command if one is given.
         self.desc = desc
@@ -235,6 +233,57 @@ class ServiceBot():
         else:
             raise NotImplementedError("Network specific plugins not supported yet.")
 
+    def join(self, irc, channels, autojoin=True):
+        """
+        Joins the given service bot to the given channel(s).
+        """
+
+        if type(irc) == str:
+            netname = irc
+        else:
+            netname = irc.name
+
+        # Ensure type safety: pluralize strings if only one channel was given, then convert to set.
+        if type(channels) == str:
+            channels = [channels]
+        channels = set(channels)
+
+        if autojoin:
+            log.debug('(%s/%s) Adding channels %s to autojoin', netname, self.name, channels)
+            self.extra_channels[netname] |= channels
+
+        # If the network was given as a string, look up the Irc object here.
+        try:
+            irc = world.networkobjects[netname]
+        except KeyError:
+            log.debug('(%s/%s) Skipping join(), IRC object not initialized yet', irc, self.name)
+            return
+
+        try:
+            u = self.uids[irc.name]
+        except KeyError:
+            log.debug('(%s/%s) Skipping join(), UID not initialized yet', irc.name, self.name)
+            return
+
+        # Specify modes to join the services bot with.
+        joinmodes = irc.serverdata.get("%s_joinmodes" % self.name) or conf.conf.get(self.name, {}).get('joinmodes') or ''
+        joinmodes = ''.join([m for m in joinmodes if m in irc.prefixmodes])
+
+        for chan in channels:
+            if isChannel(chan):
+                if u in irc.channels[chan].users:
+                    log.debug('(%s) Skipping join of services %s to channel %s - it is already present', irc.name, self.name, chan)
+                    continue
+                log.debug('(%s) Joining services %s to channel %s with modes %r', irc.name, self.name, chan, joinmodes)
+                if joinmodes:  # Modes on join were specified; use SJOIN to burst our service
+                    irc.proto.sjoin(irc.sid, chan, [(joinmodes, u)])
+                else:
+                    irc.proto.join(u, chan)
+
+                irc.callHooks([irc.sid, 'PYLINK_SERVICE_JOIN', {'channel': chan, 'users': [u]}])
+            else:
+                log.warning('(%s) Ignoring invalid autojoin channel %r.', irc.name, chan)
+
     def reply(self, irc, text, notice=False, private=False):
         """Replies to a message as the service in question."""
         servuid = self.uids.get(irc.name)
@@ -243,6 +292,15 @@ class ServiceBot():
             return
 
         irc.reply(text, notice=notice, source=servuid, private=private)
+
+    def error(self, irc, text, notice=False, private=False):
+        """Replies with an error, as the service in question."""
+        servuid = self.uids.get(irc.name)
+        if not servuid:
+            log.warning("(%s) Possible desync? UID for service %s doesn't exist!", irc.name, self.name)
+            return
+
+        irc.error(text, notice=notice, source=servuid, private=private)
 
     def call_cmd(self, irc, source, text, called_in=None):
         """
@@ -310,14 +368,21 @@ class ServiceBot():
                     lines = doc.splitlines()
                     # Bold the first line, which usually just tells you what
                     # arguments the command takes.
-                    lines[0] = '\x02%s %s\x02' % (command, lines[0])
+                    args_desc = '\x02%s %s\x02' % (command, lines[0])
 
-                    if shortform:  # Short form is just the command name + args.
-                        _reply(lines[0].strip())
-                    else:
-                        for line in lines:
-                            # Otherwise, just output the rest of the docstring to IRC.
-                            _reply(line.strip())
+                    _reply(args_desc.strip())
+                    if not shortform:
+                        # Note: we handle newlines in docstrings a bit differently. Per
+                        # https://github.com/GLolol/PyLink/issues/307, only double newlines
+                        # have the effect of showing a new line on IRC. Single newlines
+                        # are stripped so that word wrap can be applied in the source code
+                        # without actually affecting the output on IRC.
+                        for line in doc.replace('\r', '').split('\n\n')[1:]:
+                            _reply(' ')  # Empty line to break up output a bit.
+                            real_line = line.replace('\n', ' ')
+                            real_line = real_line.strip()
+                            real_line = NORMALIZEWHITESPACE_RE.sub(' ', real_line)
+                            _reply(real_line)
                 else:
                     _reply("Error: Command %r doesn't offer any help." % command)
                     return
@@ -341,26 +406,50 @@ class ServiceBot():
             self._show_command_help(irc, command)
 
     def listcommands(self, irc, source, args):
-        """takes no arguments.
+        """[<plugin name>]
 
-        Returns a list of available commands this service has to offer."""
+        Returns a list of available commands this service has to offer. The optional
+        plugin name argument also allows you to filter commands by plugin (case
+        insensitive)."""
+
+        try:
+            plugin_filter = args[0].lower()
+        except IndexError:
+            plugin_filter = None
 
         # Don't show CTCP handlers in the public command list.
-        cmds = sorted([cmd for cmd in self.commands.keys() if '\x01' not in cmd])
+        cmds = sorted(cmd for cmd in self.commands.keys() if '\x01' not in cmd)
+
+        if plugin_filter is not None:
+            # Filter by plugin, if the option was given.
+            new_cmds = []
+
+            # Add the pylinkirc.plugins prefix to the module name, so it can be used for matching.
+            plugin_module = PLUGIN_PREFIX + plugin_filter
+
+            for cmd_definition in cmds:
+                for cmdfunc in self.commands[cmd_definition]:
+                    if cmdfunc.__module__.lower() == plugin_module:
+                        new_cmds.append(cmd_definition)
+
+            # Replace the old command list.
+            cmds = new_cmds
 
         if cmds:
             self.reply(irc, 'Available commands include: %s' % ', '.join(cmds))
             self.reply(irc, 'To see help on a specific command, type \x02help <command>\x02.')
-        else:
+        elif not plugin_filter:
             self.reply(irc, 'This service doesn\'t provide any public commands.')
+        else:
+            self.reply(irc, 'This service doesn\'t provide any public commands from the plugin %s.' % plugin_filter)
 
         # If there are featured commands, list them by showing the help for each.
         # These definitions are sent in private to prevent flooding in channels.
-        if self.featured_cmds:
+        if self.featured_cmds and not plugin_filter:
             self.reply(irc, " ", private=True)
             self.reply(irc, 'Featured commands include:', private=True)
             for cmd in sorted(self.featured_cmds):
-                if self.commands.get(cmd):
+                if cmd in cmds:
                     # Only show featured commands that are both defined and loaded.
                     # TODO: perhaps plugin unload should remove unused featured command
                     # definitions automatically?
@@ -392,3 +481,35 @@ def unregisterService(name):
         ircobj.proto.quit(uid, "Service unloaded.")
 
     del world.services[name]
+
+def wrapArguments(prefix, args, length, separator=' ', max_args_per_line=0):
+    """
+    Takes a static prefix and a list of arguments, and returns a list of strings
+    with the arguments wrapped across multiple lines. This is useful for breaking up
+    long SJOIN or MODE strings so they aren't cut off by message length limits.
+    """
+    strings = []
+
+    assert args, "wrapArguments: no arguments given"
+
+    buf = prefix
+
+    args = list(args)
+
+    while args:
+        assert len(prefix+args[0]) <= length, \
+            "wrapArguments: Argument %r is too long for the given length %s" % (args[0], length)
+
+        # Add arguments until our buffer is up to the length limit.
+        if (len(buf + args[0]) + 1) <= length and ((not max_args_per_line) or len(buf.split(' ')) < max_args_per_line):
+            if buf != prefix:  # Only add a separator if this isn't the first argument of a line
+                buf += separator
+            buf += args.pop(0)
+        else:
+            # Once this is full, add the string to the list and reset the buffer.
+            strings.append(buf)
+            buf = prefix
+    else:
+        strings.append(buf)
+
+    return strings

@@ -46,25 +46,51 @@ bot:
     save_delay: 300
 
 login:
-    # PyLink administrative login - Change this, or the service will not start!
-    user: admin
-    password: changeme
+    # NOTE: for users migrating from PyLink < 1.1, the old login:user/login:password settings
+    # have been deprecated. We strongly recommend migrating to the new "accounts:" block below, as
+    # it supports multiple accounts, hashed passwords, and allows more flexibility (accounts no
+    # longer imply admin access). However, you must also add your account to the "permissions:"
+    # block below, or you will lose IRC administration access to your PyLink daemon!
+    accounts:
+        # Creates an account with username "user1". You can define other usernames at the
+        # same level here (key name is user name).
+        user1:
+            # Defines the password for the user. You can encrypt passwords using the
+            # 'mkpasswd' command or the 'pylink-mkpasswd' utility included with PyLink.
+            password: "$6$rounds=81447$WlVlZYCgbnjPmVqy$28Tu/Zl0xNpePqimax2wABKn5GCoWomYEI1Pu5jqYyQNULazR4BxQmscZ0MgBHqBCCke.3u5eOtBSZwL3WwVf0"
+
+            # Determines whether the password given is in plain-text. Defaults to false
+            # (plain text) for backwards compatibility.
+            encrypted: true
+
+permissions:
+    # Permissions are described in more detail in example-permissions.yml, if you want to
+    # customize permissions further.
+
+    # Replace ABC123 with your PyLink account name (configured above)
+    # in order to give yourself admin access.
+    "$pylinkacc:ABC123":
+        - "*"
 
 servers:
     # Please note: these are only EXAMPLE link blocks. You should edit them and
     # remove ones that you don't need in your config.
 
     # Short name for the network. This is used for relay's nick suffixes, the
-    # network plugin's (dis)connect commands, and elsewhere internally.
-    # You should change this to some abbreviation representing your network
-    # name; usually something 3-5 characters should be good.
+    # network plugin's (dis)connect commands, and various other places internally.
+    # CHANGE THIS to some abbreviation representing your network; usually
+    # something 3-5 characters should be good.
     inspnet:
+
         # Server IP, port, and passwords. The ip: field also supports resolving
         # hostnames.
         ip: 127.0.0.1
         port: 7000
         recvpass: "abcd"
         sendpass: "abcd"
+
+        # Set the bind host, useful for multi-homed hosts.
+        #bindhost: 1.2.3.4
 
         # The full network name, used by plugins.
         netname: "InspIRCd Network"
@@ -97,7 +123,7 @@ servers:
         # disable autoconnect entirely.
         autoconnect: 5
 
-        # Sets the ping frequency in seconds (i.e. how long we should wait between 
+        # Sets the ping frequency in seconds (i.e. how long we should wait between
         # sending pings to our uplink). When more than two consecutive pings are missed,
         # PyLink will disconnect with a ping timeout. This defaults to 90 if not set.
         pingfreq: 90
@@ -262,11 +288,25 @@ servers:
         pylink_nick: pybot
         #pylink_ident: pybot
 
-        # SSL options. Certfile and keyfile are optional but can be used for CertFP login if
-        # supported.
+        # SSL options. Certfile and keyfile are optional, but can be used for CertFP/SASL external
+        # if supported.
         ssl: true
         #ssl_certfile: mycert.pem
         #ssl_keyfile: mycert.pem
+
+        # SASL login: for mechanisms, only EXTERNAL (SSL cert) and PLAIN (username and password)
+        # are supported so far.
+        # SASL PLAIN requires the sasl_username and sasl_password options to be set, while
+        # SASL EXTERNAL requires ssl, ssl_certfile, and ssl_keyfile to work.
+        #sasl_mechanism: "PLAIN"
+        #sasl_username: "mIRCsKripterz"
+        #sasl_password: "DownLoaditn00b!!!"
+
+        # If this option is enabled, the bot will attempt SASL authentication even after it's
+        # connected, as services become available throughout netsplits and reconnects.
+        # Note: This requires an IRC server capable of IRCv3.2 cap-notify and sasl:
+        # InspIRCd 3.x and charybdis 4+ (and derivatives) are some compatible examples (as of 2016-12-19)
+        #sasl_reauth: true
 
         # Autoconnect works like usual.
         autoconnect: 30
@@ -279,6 +319,11 @@ servers:
         # Clientbot also supports auto perform, using raw IRC messages.
         #autoperform:
         #   - "NOTICE somebody :hello, i've connected"
+
+        # Determines whether oper statuses should be tracked on this Clientbot network. This
+        # defaults to False for the best security, since oper status may allow more access to the
+        # entire PyLink service than what's desired, even when PyLink is only connected as a bot.
+        track_oper_statuses: false
 
 # Plugins to load (omit the .py extension)
 plugins:
@@ -315,7 +360,7 @@ plugins:
     # nick or configurable prefix characters.
     #- fantasy
 
-    # Changehost plugin: Automatically changes the hostmask (i.e. sets vHosts) on 
+    # Changehost plugin: Automatically changes the hostmask (i.e. sets vHosts) on
     # matching users as they connect. This requires the changehost: block
     # to be configured correctly below.
     #- changehost
@@ -324,6 +369,9 @@ plugins:
     # exttargets. See https://github.com/GLolol/PyLink/blob/master/docs/automode.md
     # for a usage guide.
     #- automode
+
+    # Servermaps plugin: displays network /map's from the PyLink server's perspective.
+    #- servermaps
 
 logging:
     # This configuration block defines targets that PyLink should log commands,
@@ -360,7 +408,6 @@ logging:
         # Logs to file targets. These will be placed in the log/ folder in the
         # PyLink directory, with a filename based on the current instance name
         # and the target name: instancename-targetname.log
-        # Changing settings in this block will require a restart to take effect.
 
         # When running with ./pylink, this will create log/pylink-errors.log
         # When running with ./pylink someconf.yml, this will create log/someconf-errors.log
@@ -392,10 +439,29 @@ changehost:
     # This block configures the Changehost plugin. You don't need this if you
     # aren't using it.
 
-    # Sets the networks where Changehost should be enabled.
+    # Sets the networks where Changehost should be enabled. Please note: changehost does NOT support
+    # arbitrarily cloaking clients introduced by PyLink (e.g. relay clients), as doing so would make
+    # ban matching impossible. In these cases, it is the remote admin's job to turn on cloaking on
+    # their IRCd!
     enabled_nets:
         - inspnet
         - ts6net
+
+    # Sets the networks where Changehost hosts should be enforced: that is, any attempts
+    # by the user or other services to overwrite a host will be reverted.
+    #enforced_nets:
+    #    - inspnet
+
+    # Sets the masks that Changehost enforcement should ignore: these can be users with certain
+    # hosts, exttargets, etc.
+    enforce_exceptions:
+        - "*!*@yournet/staff/*"
+        #- "$account"
+
+    # Determines whether Changehost rules should also match the host portion of a mask by IP and
+    # real hosts. These default to false.
+    #match_ip: false
+    #match_realhosts: false
 
     # This sets the hostmasks that Changehost should look for. Whenever someone
     # with a matching nick!user@host connects, their host will be set to the
@@ -477,6 +543,20 @@ relay:
     # net2.relay, etc.) if not specified.
     #server_suffix: "relay.yournet.net"
 
+    # Sets whether Clientbot mode sync will be enabled. Valid options:
+    # "full" - Sync bans, ban/invite exceptions, prefix modes, and all RFC1459-standard modes. The
+    #          bot will need op in the Clientbot channel for this to work both ways.
+    # "half" - Sync only bans, ban/invite exceptions, and prefix modes. The bot will need op in the
+    #          Clientbot channel for this to work both ways.
+    # "none" - Turns off mode sync. This is the default.
+    #
+    # Note: when mode sync is enabled and the bot is opped, CLAIM protection will be enforced across
+    # Clientbot links as well. This means that the bot will try to revert any mode changes by non-ops
+    # or services not in the channel. The workaround is to add all Clientbot networks to the CLAIM
+    # list of any affected channels.
+    #
+    #clientbot_modesync: none
+
 games:
     # Sets the nick of the Games service, if you're using it. This defaults to "games" if not defined.
     nick: Games
@@ -484,3 +564,8 @@ games:
 automode:
     # Sets the nick of the Automode service, if you're using it. This defaults to "automode" if not defined.
     nick: Automode
+
+    # For each service, you can also specify what prefix modes you want the service bot to join channels with.
+    # Setting this to op (+o) for Automode makes it appear more like a standard IRC service, and lessens
+    # the risk of mode overrides being dropped.
+    joinmodes: 'o'

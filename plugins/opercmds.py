@@ -3,18 +3,19 @@ opercmds.py: Provides a subset of network management commands.
 """
 from pylinkirc import utils
 from pylinkirc.log import log
+from pylinkirc.coremods import permissions
 
 @utils.add_cmd
 def checkban(irc, source, args):
     """<banmask (nick!user@host or user@host)> [<nick or hostmask to check>]
 
     Oper only. If a nick or hostmask is given, return whether the given banmask will match it. Otherwise, returns a list of connected users that would be affected by such a ban, up to 50 results."""
-    irc.checkAuthenticated(source)
+    permissions.checkPermissions(irc, source, ['opercmds.checkban'])
 
     try:
         banmask = args[0]
     except IndexError:
-        irc.reply("Error: Not enough arguments. Needs 1-2: banmask, nick or hostmask to check (optional).")
+        irc.error("Not enough arguments. Needs 1-2: banmask, nick or hostmask to check (optional).")
         return
 
     try:
@@ -55,18 +56,18 @@ def jupe(irc, source, args):
     Admin only, jupes the given server."""
 
     # Check that the caller is either opered or logged in as admin.
-    irc.checkAuthenticated(source, allowOper=False)
+    permissions.checkPermissions(irc, source, ['opercmds.jupe'])
 
     try:
         servername = args[0]
         reason = ' '.join(args[1:]) or "No reason given"
         desc = "Juped by %s: [%s]" % (irc.getHostmask(source), reason)
     except IndexError:
-        irc.reply('Error: Not enough arguments. Needs 1-2: servername, reason (optional).')
+        irc.error('Not enough arguments. Needs 1-2: servername, reason (optional).')
         return
 
     if not utils.isServerName(servername):
-        irc.reply("Error: Invalid server name '%s'." % servername)
+        irc.error("Invalid server name '%s'." % servername)
         return
 
     sid = irc.proto.spawnServer(servername, desc=desc)
@@ -79,76 +80,55 @@ def jupe(irc, source, args):
 
 @utils.add_cmd
 def kick(irc, source, args):
-    """<source> <channel> <user> [<reason>]
+    """<channel> <user> [<reason>]
 
-    Admin only. Kicks <user> from <channel> via <source>, where <source> is either the nick of a PyLink client or the SID of a PyLink server."""
-    irc.checkAuthenticated(source, allowOper=False)
+    Admin only. Kicks <user> from the specified channel."""
+    permissions.checkPermissions(irc, source, ['opercmds.kick'])
     try:
-        sourcenick = args[0]
-        channel = irc.toLower(args[1])
-        target = args[2]
-        reason = ' '.join(args[3:])
+        channel = irc.toLower(args[0])
+        target = args[1]
+        reason = ' '.join(args[2:])
     except IndexError:
-        irc.reply("Error: Not enough arguments. Needs 3-4: source nick, channel, target, reason (optional).")
+        irc.error("Not enough arguments. Needs 2-3: channel, target, reason (optional).")
         return
 
-    # Convert the source and target nicks to UIDs.
-    sender = irc.nickToUid(sourcenick) or sourcenick
     targetu = irc.nickToUid(target)
 
     if channel not in irc.channels:  # KICK only works on channels that exist.
-        irc.reply("Error: Unknown channel %r." % channel)
+        irc.error("Unknown channel %r." % channel)
         return
 
-    if (not irc.isInternalClient(sender)) and \
-            (not irc.isInternalServer(sender)):
-        # Whatever we were told to send the kick from wasn't valid; try to be
-        # somewhat user friendly in the error message
-        irc.reply("Error: No such PyLink client '%s'. The first argument to "
-                  "KICK should be the name of a PyLink client (e.g. '%s'; see "
-                  "'help kick' for details." % (sourcenick,
-                  irc.pseudoclient.nick))
-        return
-    elif not targetu:
+    if not targetu:
         # Whatever we were told to kick doesn't exist!
-        irc.reply("Error: No such target nick '%s'." % target)
+        irc.error("No such target nick '%s'." % target)
         return
 
+    sender = irc.pseudoclient.uid
     irc.proto.kick(sender, channel, targetu, reason)
     irc.callHooks([sender, 'CHANCMDS_KICK', {'channel': channel, 'target': targetu,
                                         'text': reason, 'parse_as': 'KICK'}])
 
 @utils.add_cmd
 def kill(irc, source, args):
-    """<source> <target> [<reason>]
+    """<target> [<reason>]
 
-    Admin only. Kills <target> via <source>, where <source> is either the nick of a PyLink client or the SID of a PyLink server."""
-    irc.checkAuthenticated(source, allowOper=False)
+    Admin only. Kills the given target."""
+    permissions.checkPermissions(irc, source, ['opercmds.kill'])
     try:
-        sourcenick = args[0]
-        target = args[1]
-        reason = ' '.join(args[2:])
+        target = args[0]
+        reason = ' '.join(args[1:])
     except IndexError:
-        irc.reply("Error: Not enough arguments. Needs 3-4: source nick, target, reason (optional).")
+        irc.error("Not enough arguments. Needs 1-2: target, reason (optional).")
         return
 
     # Convert the source and target nicks to UIDs.
-    sender = irc.nickToUid(sourcenick) or sourcenick
+    sender = irc.pseudoclient.uid
     targetu = irc.nickToUid(target)
     userdata = irc.users.get(targetu)
 
-    if (not irc.isInternalClient(sender)) and \
-            (not irc.isInternalServer(sender)):
-        # Whatever we were told to send the kick from wasn't valid; try to be
-        # somewhat user friendly in the error message
-        irc.reply("Error: No such PyLink client '%s'. The first argument to "
-                  "KILL should be the name of a PyLink client (e.g. '%s'; see "
-                  "'help kill' for details." % (sourcenick,
-                  irc.pseudoclient.nick))
-        return
-    elif targetu not in irc.users:
+    if targetu not in irc.users:
         # Whatever we were told to kick doesn't exist!
-        irc.reply("Error: No such nick '%s'." % target)
+        irc.error("No such nick '%s'." % target)
         return
 
     irc.proto.kill(sender, targetu, reason)
@@ -166,20 +146,20 @@ def mode(irc, source, args):
     Oper-only, sets modes <modes> on the target channel."""
 
     # Check that the caller is either opered or logged in as admin.
-    irc.checkAuthenticated(source)
+    permissions.checkPermissions(irc, source, ['opercmds.mode'])
 
     try:
         target, modes = args[0], args[1:]
     except IndexError:
-        irc.reply('Error: Not enough arguments. Needs 2: target, modes to set.')
+        irc.error('Not enough arguments. Needs 2: target, modes to set.')
         return
 
     if target not in irc.channels:
-        irc.reply("Error: Unknown channel '%s'." % target)
+        irc.error("Unknown channel '%s'." % target)
         return
     elif not modes:
         # No modes were given before parsing (i.e. mode list was blank).
-        irc.reply("Error: No valid modes were given.")
+        irc.error("No valid modes were given.")
         return
 
     parsedmodes = irc.parseModes(target, modes)
@@ -188,7 +168,7 @@ def mode(irc, source, args):
         # Modes were given but they failed to parse into anything meaningful.
         # For example, "mode #somechan +o" would be erroneous because +o
         # requires an argument!
-        irc.reply("Error: No valid modes were given.")
+        irc.error("No valid modes were given.")
         return
 
     irc.proto.mode(irc.pseudoclient.uid, target, parsedmodes)
@@ -204,16 +184,16 @@ def topic(irc, source, args):
     """<channel> <topic>
 
     Admin only. Updates the topic in a channel."""
-    irc.checkAuthenticated(source, allowOper=False)
+    permissions.checkPermissions(irc, source, ['opercmds.topic'])
     try:
         channel = args[0]
         topic = ' '.join(args[1:])
     except IndexError:
-        irc.reply("Error: Not enough arguments. Needs 2: channel, topic.")
+        irc.error("Not enough arguments. Needs 2: channel, topic.")
         return
 
     if channel not in irc.channels:
-        irc.reply("Error: Unknown channel %r." % channel)
+        irc.error("Unknown channel %r." % channel)
         return
 
     irc.proto.topic(irc.pseudoclient.uid, channel, topic)

@@ -12,6 +12,8 @@ from pylinkirc.classes import *
 from pylinkirc.log import log
 from pylinkirc.protocols.ircs2s_common import *
 
+S2S_BUFSIZE = 510
+
 class P10UIDGenerator(utils.IncrementalUIDGenerator):
      """Implements an incremental P10 UID Generator."""
 
@@ -277,7 +279,7 @@ class P10Protocol(IRCS2SProtocol):
         raw_modes = self.irc.joinModes(modes)
 
         # Initialize an IrcUser instance
-        u = self.irc.users[uid] = IrcUser(nick, ts, uid, ident=ident, host=host, realname=realname,
+        u = self.irc.users[uid] = IrcUser(nick, ts, uid, server, ident=ident, host=host, realname=realname,
                                           realhost=realhost, ip=ip, manipulatable=manipulatable,
                                           opertype=opertype)
 
@@ -399,33 +401,40 @@ class P10Protocol(IRCS2SProtocol):
         modes = list(modes)
 
         # According to the P10 specification:
-        # https://github.com/evilnet/nefarious2/blob/master/doc/p10.txt#L29
+        # https://github.com/evilnet/nefarious2/blob/4e2dcb1/doc/p10.txt#L146
         # One line can have a max of 15 parameters. Excluding the target and the first part of the
         # modestring, this means we can send a max of 13 modes with arguments per line.
-        if utils.isChannel(target):
+        is_cmode = utils.isChannel(target)
+        if is_cmode:
             # Channel mode changes have a trailing TS. User mode changes do not.
             cobj = self.irc.channels[self.irc.toLower(target)]
             ts = ts or cobj.ts
-            send_ts = True
 
             # HACK: prevent mode bounces by sending our mode through the server if
             # the sender isn't op.
             if numeric not in self.irc.servers and (not cobj.isOp(numeric)) and (not cobj.isHalfop(numeric)):
                 numeric = self.irc.getServer(numeric)
 
+            # Wrap modes: start with max bufsize and subtract the lengths of the source, target,
+            # mode command, and whitespace.
+            bufsize = S2S_BUFSIZE - len(numeric) - 4 - len(target) - len(str(ts))
+
             real_target = target
         else:
             assert target in self.irc.users, "Unknown mode target %s" % target
             # P10 uses nicks in user MODE targets, NOT UIDs. ~GL
             real_target = self.irc.users[target].nick
-            send_ts = False
 
         self.irc.applyModes(target, modes)
 
         while modes[:12]:
             joinedmodes = self.irc.joinModes([m for m in modes[:12]])
+            if is_cmode:
+                for wrapped_modes in self.irc.wrapModes(modes[:12], bufsize):
+                    self._send(numeric, 'M %s %s %s' % (real_target, wrapped_modes, ts))
+            else:
+                self._send(numeric, 'M %s %s%s' % (real_target, joinedmodes))
             modes = modes[12:]
-            self._send(numeric, 'M %s %s%s' % (real_target, joinedmodes, ' %s' % ts if send_ts else ''))
 
     def nick(self, numeric, newnick):
         """Changes the nick of a PyLink client."""
@@ -537,6 +546,10 @@ class P10Protocol(IRCS2SProtocol):
         # Joins should look like: A0AAB,A0AAC,ABAAA:v,ABAAB:o,ABAAD,ACAAA:ov
         users = sorted(users, key=self.access_sort)
 
+        msgprefix = '{sid} B {channel} {ts} '.format(sid=server, channel=channel, ts=ts)
+        if regularmodes:
+            msgprefix += '%s ' % self.irc.joinModes(regularmodes)
+
         last_prefixes = ''
         for userpair in users:
             # We take <users> as a list of (prefixmodes, uid) pairs.
@@ -559,30 +572,59 @@ class P10Protocol(IRCS2SProtocol):
                     changedmodes.add(('+%s' % prefix, user))
 
             self.irc.users[user].channels.add(channel)
-
-        namelist = ','.join(namelist)
-        log.debug('(%s) sjoin: got %r for namelist', self.irc.name, namelist)
-
-        # Format bans as the last argument if there are any.
-        banstring = ''
-        if bans or exempts:
-            banstring += ' :%'  # Ban string starts with a % if there is anything
-            if bans:
-                banstring += ' '.join(bans)  # Join all bans, separated by a space
-            if exempts:
-                # Exempts are separated from the ban list by a single argument "~".
-                banstring += ' ~ '
-                banstring += ' '.join(exempts)
-
-        if modes:  # Only send modes if there are any.
-            self._send(server, "B {channel} {ts} {modes} {users}{banstring}".format(
-                       ts=ts, users=namelist, channel=channel,
-                       modes=self.irc.joinModes(regularmodes), banstring=banstring))
         else:
-            self._send(server, "B {channel} {ts} {users}{banstring}".format(
-                       ts=ts, users=namelist, channel=channel, banstring=banstring))
+            if namelist:
+                log.debug('(%s) sjoin: got %r for namelist', self.irc.name, namelist)
+
+                # Flip the (prefixmodes, user) pairs in users, and save it as a dict for easy lookup
+                # later of what modes each target user should have.
+                names_dict = dict([(uid, prefixes) for prefixes, uid in users])
+
+                # Wrap all users and send them to prevent cutoff. Subtract 4 off the maximum
+                # buf size to account for user prefix data that may be re-added (e.g. ":ohv")
+                for linenum, wrapped_msg in \
+                        enumerate(utils.wrapArguments(msgprefix, namelist, S2S_BUFSIZE-1-len(self.irc.prefixmodes),
+                                                      separator=',')):
+                    if linenum:  # Implies "if linenum > 0"
+                        # XXX: Ugh, this postprocessing sucks, but we have to make sure that mode prefixes are accounted
+                        # for in the burst.
+                        wrapped_args = self.parseArgs(wrapped_msg.split(" "))
+                        wrapped_namelist = wrapped_args[-1].split(',')
+                        log.debug('(%s) sjoin: wrapped args: %s (post-wrap fixing)', self.irc.name,
+                                  wrapped_args)
+
+                        # If the first UID was supposed to have a prefix mode attached, re-add it here
+                        first_uid = wrapped_namelist[0]
+                        # XXX: I'm not sure why the prefix list has to be reversed for it to match the
+                        # original string...
+                        first_prefix = names_dict.get(first_uid, '')[::-1]
+                        log.debug('(%s) sjoin: prefixes for first user %s: %s (post-wrap fixing)', self.irc.name,
+                                  first_uid, first_prefix)
+
+                        if (':' not in first_uid) and first_prefix:
+                            log.debug('(%s) sjoin: re-adding prefix %s to user %s (post-wrap fixing)', self.irc.name,
+                                      first_uid, first_prefix)
+                            wrapped_namelist[0] += ':%s' % prefixes
+                            wrapped_msg = ' '.join(wrapped_args[:-1])
+                            wrapped_msg += ' '
+                            wrapped_msg += ','.join(wrapped_namelist)
+
+                    self.irc.send(wrapped_msg)
 
         self.irc.channels[channel].users.update(changedusers)
+
+        # Technically we can send bans together with the above user introductions, but
+        # it's easier to line wrap them separately.
+        if bans or exempts:
+            msgprefix += ':%'  # Ban string starts with a % if there is anything
+            if bans:
+                for wrapped_msg in utils.wrapArguments(msgprefix, bans, S2S_BUFSIZE):
+                    self.irc.send(wrapped_msg)
+            if exempts:
+                # Now add exempts, which are separated from the ban list by a single argument "~".
+                msgprefix += ' ~ '
+                for wrapped_msg in utils.wrapArguments(msgprefix, exempts, S2S_BUFSIZE):
+                    self.irc.send(wrapped_msg)
 
         self.updateTS(server, channel, ts, changedmodes)
 
@@ -839,7 +881,7 @@ class P10Protocol(IRCS2SProtocol):
                       'host=%s realname=%s realhost=%s ip=%s', self.irc.name, nick, ts, uid,
                       ident, host, realname, realhost, ip)
 
-            uobj = self.irc.users[uid] = IrcUser(nick, ts, uid, ident, host, realname, realhost, ip)
+            uobj = self.irc.users[uid] = IrcUser(nick, ts, uid, source, ident, host, realname, realhost, ip)
             self.irc.servers[source].users.add(uid)
 
             # https://github.com/evilnet/nefarious2/blob/master/doc/p10.txt#L708
@@ -966,12 +1008,6 @@ class P10Protocol(IRCS2SProtocol):
         if args[0] != self.irc.serverdata['recvpass']:
             raise ProtocolError("Error: RECVPASS from uplink does not match configuration!")
 
-    def handle_pong(self, source, command, args):
-        """Handles incoming PONGs."""
-        # <- AB Z AB :Ay
-        if source == self.irc.uplink:
-            self.irc.lastping = time.time()
-
     def handle_burst(self, source, command, args):
         """Handles the BURST command, used for bursting channels on link.
 
@@ -993,8 +1029,6 @@ class P10Protocol(IRCS2SProtocol):
 
         channel = self.irc.toLower(args[0])
         chandata = self.irc.channels[channel].deepcopy()
-
-        userlist = args[-1].split()
 
         bans = []
         if args[-1].startswith('%'):
@@ -1025,20 +1059,13 @@ class P10Protocol(IRCS2SProtocol):
         else:
             parsedmodes = []
 
-        # This list is used to keep track of prefix modes being added to the mode list.
-        changedmodes = set(parsedmodes)
-
-        # Also add the the ban list to the list of modes to process internally.
-        parsedmodes.extend(bans)
-        if parsedmodes:
-            self.irc.applyModes(channel, parsedmodes)
+        changedmodes = set(parsedmodes + bans)
 
         namelist = []
-        log.debug('(%s) handle_sjoin: got userlist %r for %r', self.irc.name, userlist, channel)
-
         prefixes = ''
-
         userlist = args[-1].split(',')
+        log.debug('(%s) handle_burst: got userlist %r for %r', self.irc.name, userlist, channel)
+
         if args[-1] != args[1]:  # Make sure the user list is the right argument (not the TS).
             for userpair in userlist:
                 # This is given in the form UID1,UID2:prefixes. However, when one userpair is given

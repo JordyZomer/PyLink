@@ -3,9 +3,10 @@ control.py - Implements SHUTDOWN and REHASH functionality.
 """
 import signal
 import os
+import threading
 
 from pylinkirc import world, utils, conf, classes
-from pylinkirc.log import log, makeFileLogger, stopFileLoggers
+from pylinkirc.log import log, makeFileLogger, stopFileLoggers, stdoutLogLevel
 from . import permissions
 
 def remove_network(ircobj):
@@ -33,6 +34,19 @@ def _shutdown(irc=None):
         # Disconnect all our networks.
         remove_network(ircobj)
 
+    # Remove our pid file.
+    log.info("Removing our pid.")
+    try:
+        os.remove("%s.pid" % conf.confname)
+    except OSError:
+        log.exception("Failed to remove PID, ignoring...")
+
+    log.info("Waiting for remaining threads to stop; this may take a few seconds. If PyLink freezes "
+             "at this stage, press Ctrl-C to force a shutdown.")
+    log.debug('_shutdown(): Remaining threads: %s', ['%s/%s' % (t.name, t.ident) for t in threading.enumerate()])
+
+    # Done.
+
 def sigterm_handler(signo, stack_frame):
     """Handles SIGTERM and SIGINT gracefully by shutting down the PyLink daemon."""
     log.info("Shutting down on signal %s." % signo)
@@ -45,7 +59,7 @@ def _rehash():
     """Rehashes the PyLink daemon."""
     old_conf = conf.conf.copy()
     fname = conf.fname
-    new_conf = conf.loadConf(fname, errors_fatal=False)
+    new_conf = conf.loadConf(fname, errors_fatal=False, logger=log)
     new_conf = conf.validateConf(new_conf)
     conf.conf = new_conf
 
@@ -56,8 +70,11 @@ def _rehash():
         for filename, config in files.items():
             makeFileLogger(filename, config.get('loglevel'))
 
+    log.debug('rehash: updating STDOUT log level')
+    world.stdout_handler.setLevel(stdoutLogLevel())
+
     # Reset permissions.
-    log.debug('rehash: resetting permissions.')
+    log.debug('rehash: resetting permissions')
     permissions.resetPermissions()
 
     for network, ircobj in world.networkobjects.copy().items():
