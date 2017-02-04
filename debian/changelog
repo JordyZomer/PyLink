@@ -1,3 +1,9 @@
+pylink (1.1.0.1-0utopia1~bpo8+1) jessie-backports; urgency=medium
+
+  * Rebuild for jessie-backports.
+
+ -- James Lu <bitflip3@gmail.com>  Fri, 03 Feb 2017 18:41:20 -0800
+
 pylink (1.1.0.1-0utopia1) unstable; urgency=medium
 
   * New release.
