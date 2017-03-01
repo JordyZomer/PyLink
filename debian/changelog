@@ -1,3 +1,11 @@
+pylink (1.1.1-0utopia1) unstable; urgency=medium
+
+  * New release.
+  * Drop mkpasswd-updates.patch; included in 1.1.1.
+  * Add Enhances: fields with inspircd, ircd-ratbox, charybdis, ircd-hybrid
+
+ -- James Lu <bitflip3@gmail.com>  Tue, 28 Feb 2017 21:20:24 -0800
+
 pylink (1.1.0.1-0utopia1~bpo8+1) jessie-backports; urgency=medium
 
   * Rebuild for jessie-backports.

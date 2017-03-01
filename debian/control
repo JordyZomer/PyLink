@@ -20,6 +20,7 @@ Depends: ${python3:Depends},
          python3-yaml
 Recommends: python3-expiringdict, python3-passlib
 Suggests: pylink-doc
+Enhances: inspircd, ircd-ratbox, charybdis, ircd-hybrid
 Description: Multi-network IRC Services & server-side relayer
  PyLink is an extensible, plugin-based IRC services framework written in
  Python. It aims to be:
