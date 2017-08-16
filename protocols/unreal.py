@@ -7,7 +7,7 @@ import codecs
 import socket
 import re
 
-from pylinkirc import utils
+from pylinkirc import utils, conf
 from pylinkirc.classes import *
 from pylinkirc.log import log
 from pylinkirc.protocols.ts6_common import *
@@ -23,6 +23,7 @@ S2S_BUFSIZE = 427
 class UnrealProtocol(TS6BaseProtocol):
     def __init__(self, irc):
         super().__init__(irc)
+        self.protocol_caps |= {'slash-in-nicks', 'underscore-in-hosts'}
         # Set our case mapping (rfc1459 maps "\" and "|" together, for example)
         self.casemapping = 'ascii'
         self.proto_ver = 4000
@@ -73,7 +74,7 @@ class UnrealProtocol(TS6BaseProtocol):
         uid = self.uidgen[server].next_uid()
 
         ts = ts or int(time.time())
-        realname = realname or self.irc.botdata['realname']
+        realname = realname or conf.conf['bot']['realname']
         realhost = realhost or host
 
         # Add +xt so that vHost cloaking always works.
@@ -374,7 +375,7 @@ class UnrealProtocol(TS6BaseProtocol):
         # ESVID - Supports account names in services stamps instead of just the signon time.
         #         AFAIK this doesn't actually affect services' behaviour?
         f('PROTOCTL SJOIN SJ3 NOQUIT NICKv2 VL UMODE2 PROTOCTL NICKIP EAUTH=%s SID=%s VHP ESVID' % (self.irc.serverdata["hostname"], self.irc.sid))
-        sdesc = self.irc.serverdata.get('serverdesc') or self.irc.botdata['serverdesc']
+        sdesc = self.irc.serverdata.get('serverdesc') or conf.conf['bot']['serverdesc']
         f('SERVER %s 1 U%s-h6e-%s :%s' % (host, self.proto_ver, self.irc.sid, sdesc))
         f('NETINFO 1 %s %s * 0 0 0 :%s' % (self.irc.start_ts, self.proto_ver, self.irc.serverdata.get("netname", self.irc.name)))
         self._send(self.irc.sid, 'EOS')
@@ -389,7 +390,7 @@ class UnrealProtocol(TS6BaseProtocol):
         # arguments: nick, hopcount?, ts, ident, real-host, UID, services account (0 if none), modes,
         #            displayed host, cloaked (+x) host, base64-encoded IP, and realname
         nick = args[0]
-        self.checkCollision(nick)
+        self.check_nick_collision(nick)
         ts, ident, realhost, uid, accountname, modestring, host = args[2:9]
 
         if host == '*':
@@ -453,7 +454,7 @@ class UnrealProtocol(TS6BaseProtocol):
 
     def handle_ping(self, numeric, command, args):
         if numeric == self.irc.uplink:
-            self.irc.send('PONG %s :%s' % (self.irc.serverdata['hostname'], args[-1]))
+            self.irc.send('PONG %s :%s' % (self.irc.serverdata['hostname'], args[-1]), queue=False)
 
     def handle_server(self, numeric, command, args):
         """Handles the SERVER command, which is used for both authentication and
@@ -546,15 +547,6 @@ class UnrealProtocol(TS6BaseProtocol):
         # Add in the supported prefix modes.
         self.irc.cmodes.update({'halfop': 'h', 'admin': 'a', 'owner': 'q',
                                 'op': 'o', 'voice': 'v'})
-
-    def handle_privmsg(self, source, command, args):
-        # Convert nicks to UIDs, where they exist.
-        target = self._getUid(args[0])
-        # We use lowercase channels internally, but uppercase UIDs.
-        if utils.isChannel(target):
-            target = self.irc.toLower(target)
-        return {'target': target, 'text': args[1]}
-    handle_notice = handle_privmsg
 
     def handle_join(self, numeric, command, args):
         """Handles the UnrealIRCd JOIN command."""

@@ -2,9 +2,6 @@
 corecommands.py - Implements core PyLink commands.
 """
 
-# Get the package name that plugins are stored under.
-plugin_root = __name__.split('.')[0] + '.plugins.'
-
 import gc
 import sys
 import importlib
@@ -101,7 +98,7 @@ def load(irc, source, args):
     else:
         if hasattr(pl, 'main'):
             log.debug('Calling main() function of plugin %r', pl)
-            pl.main(irc)
+            pl.main(irc=irc)
     irc.reply("Loaded plugin %r." % name)
 
 @utils.add_cmd
@@ -119,7 +116,7 @@ def unload(irc, source, args):
 
     # Since we're using absolute imports in 0.9.x+, the module name differs from the actual plugin
     # name.
-    modulename = plugin_root + name
+    modulename = utils.PLUGIN_PREFIX + name
 
     if name in world.plugins:
         log.info('(%s) Unloading plugin %r for %s', irc.name, name, irc.getHostmask(source))
@@ -153,7 +150,7 @@ def unload(irc, source, args):
         # Call the die() function in the plugin, if present.
         if hasattr(pl, 'die'):
             try:
-                pl.die(irc)
+                pl.die(irc=irc)
             except:  # But don't allow it to crash the server.
                 log.exception('(%s) Error occurred in die() of plugin %s, skipping...', irc.name, pl)
 
@@ -204,3 +201,11 @@ def rehash(irc, source, args):
         return
     else:
         irc.reply("Done.")
+
+@utils.add_cmd
+def clearqueue(irc, source, args):
+    """takes no arguments.
+
+    Clears the outgoing text queue for the current connection."""
+    permissions.checkPermissions(irc, source, ['core.clearqueue'])
+    irc.queue.queue.clear()

@@ -12,9 +12,13 @@ except ImportError:
 
 import sys
 import os.path
+import logging
 from collections import defaultdict
 
 from . import world
+
+class ConfigValidationError(Exception):
+    """Error when config conditions aren't met."""
 
 conf = {'bot':
                 {
@@ -42,36 +46,65 @@ conf = {'bot':
                                      'sidrange': '0##'
                                     })
         }
+conf['pylink'] = conf['bot']
 confname = 'unconfigured'
+
+def validate(condition, errmsg):
+    """Convenience function to validate conditions in validateConf()."""
+    if not condition:
+        raise ConfigValidationError(errmsg)
+
+def _log(level, text, *args, logger=None, **kwargs):
+    if logger:
+        logger.log(level, text, *args, **kwargs)
+    else:
+        world.log_queue.append((level, text))
 
 def validateConf(conf, logger=None):
     """Validates a parsed configuration dict."""
-    assert type(conf) == dict, "Invalid configuration given: should be type dict, not %s." % type(conf).__name__
+    validate(type(conf) == dict,
+            "Invalid configuration given: should be type dict, not %s."
+            % type(conf).__name__)
 
-    for section in ('bot', 'servers', 'login', 'logging'):
-        assert conf.get(section), "Missing %r section in config." % section
+    if 'pylink' in conf and 'bot' in conf:
+        _log(logging.WARNING, "Since PyLink 1.2, the 'pylink:' and 'bot:' configuration sections have been condensed "
+             "into one. You should merge any options under these sections into one 'pylink:' block.", logger=logger)
+
+        new_block = conf['bot'].copy()
+        new_block.update(conf['pylink'])
+        conf['bot'] = conf['pylink'] = new_block
+    elif 'pylink' in conf:
+        conf['bot'] = conf['pylink']
+    elif 'bot' in conf:
+        conf['pylink'] = conf['bot']
+        # TODO: add a migration warning in the next release.
+
+    for section in ('pylink', 'servers', 'login', 'logging'):
+        validate(conf.get(section), "Missing %r section in config." % section)
 
     # Make sure at least one form of authentication is valid.
     # Also we'll warn them that login:user/login:password is deprecated
     if conf['login'].get('password') or conf['login'].get('user'):
-        e = "The 'login:user' and 'login:password' options are deprecated since PyLink 1.1. " \
-            "Please switch to the new 'login:accounts' format as outlined in the example config."
-        if logger:
-            logger.warning(e)
-        else:
-            # FIXME: we need a better fallback when log isn't available on first
-            # start.
-            print('WARNING: %s' % e)
+        _log(logging.WARNING, "The 'login:user' and 'login:password' options are deprecated since PyLink 1.1. "
+             "Please switch to the new 'login:accounts' format as outlined in the example config.", logger=logger)
 
     old_login_valid = type(conf['login'].get('password')) == type(conf['login'].get('user')) == str
     newlogins = conf['login'].get('accounts', {})
-    new_login_valid = len(newlogins) >= 1
-    assert old_login_valid or new_login_valid, "No accounts were set, aborting!"
-    for account, block in newlogins.items():
-        assert type(account) == str, "Bad username format %s" % account
-        assert type(block.get('password')) == str, "Bad password %s for account %s" % (block.get('password'), account)
 
-    assert conf['login'].get('password') != "changeme", "You have not set the login details correctly!"
+    validate(old_login_valid or newlogins, "No accounts were set, aborting!")
+    for account, block in newlogins.items():
+        validate(type(account) == str, "Bad username format %s" % account)
+        validate(type(block.get('password')) == str, "Bad password %s for account %s" % (block.get('password'), account))
+
+    validate(conf['login'].get('password') != "changeme", "You have not set the login details correctly!")
+
+    if newlogins and not old_login_valid:
+        validate(conf.get('permissions'), "New-style accounts enabled but no permissions block was found. You will not be able to administrate your PyLink instance!")
+
+    if conf['logging'].get('stdout'):
+         _log(logging.WARNING, 'The log:stdout option is deprecated since PyLink 1.2 in favour of '
+                               '(a more correctly named) log:console. Please update your '
+                               'configuration accordingly!', logger=logger)
 
     return conf
 
@@ -92,7 +125,7 @@ def loadConf(filename, errors_fatal=True, logger=None):
         print('       Users upgrading from users < 0.9-alpha1 should note that the default configuration has been renamed to *pylink.yml*, not *config.yml*', file=sys.stderr)
 
         if errors_fatal:
-            sys.exit(4)
+            sys.exit(1)
         raise
     else:
         return conf

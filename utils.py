@@ -10,22 +10,28 @@ import re
 import importlib
 import os
 import collections
+import argparse
 
 from .log import log
 from . import world, conf
-# This is just so protocols and plugins are importable.
+
+# Load the protocol and plugin packages.
 from pylinkirc import protocols, plugins
 
-PLUGIN_PREFIX = 'pylinkirc.plugins.'
-PROTOCOL_PREFIX = 'pylinkirc.protocols.'
+PLUGIN_PREFIX = plugins.__name__ + '.'
+PROTOCOL_PREFIX = protocols.__name__ + '.'
 NORMALIZEWHITESPACE_RE = re.compile(r'\s+')
 
 class NotAuthorizedError(Exception):
     """
-    Exception raised by checkAuthenticated() when a user fails authentication
-    requirements.
+    Exception raised by the PyLink permissions system when a user fails access requirements.
     """
     pass
+
+class InvalidArgumentsError(TypeError):
+    """
+    Exception raised (by IRCParser and potentially others) when a bot command is given invalid arguments.
+    """
 
 class IncrementalUIDGenerator():
     """
@@ -142,6 +148,21 @@ def applyModes(irc, target, changedmodes):
     log.warning("(%s) utils.applyModes is deprecated. Use irc.applyModes() instead!", irc.name)
     return irc.applyModes(target, changedmodes)
 
+def expandpath(path):
+    """
+    Returns a path expanded with environment variables and home folders (~) expanded, in that order."""
+    return os.path.expanduser(os.path.expandvars(path))
+
+def resetModuleDirs():
+    """
+    (Re)sets custom protocol module and plugin directories to the ones specified in the config.
+    """
+    # Note: This assumes that the first element of the package path is the default one.
+    plugins.__path__ = [plugins.__path__[0]] + [expandpath(path) for path in conf.conf['bot'].get('plugin_dirs', [])]
+    log.debug('resetModuleDirs: new pylinkirc.plugins.__path__: %s', plugins.__path__)
+    protocols.__path__ = [protocols.__path__[0]] + [expandpath(path) for path in conf.conf['bot'].get('protocol_dirs', [])]
+    log.debug('resetModuleDirs: new pylinkirc.protocols.__path__: %s', protocols.__path__)
+
 def loadPlugin(name):
     """
     Imports and returns the requested plugin.
@@ -256,7 +277,7 @@ class ServiceBot():
         try:
             irc = world.networkobjects[netname]
         except KeyError:
-            log.debug('(%s/%s) Skipping join(), IRC object not initialized yet', irc, self.name)
+            log.debug('(%s/%s) Skipping join(), IRC object not initialized yet', netname, self.name)
             return
 
         try:
@@ -284,7 +305,7 @@ class ServiceBot():
             else:
                 log.warning('(%s) Ignoring invalid autojoin channel %r.', irc.name, chan)
 
-    def reply(self, irc, text, notice=False, private=False):
+    def reply(self, irc, text, notice=None, private=None):
         """Replies to a message as the service in question."""
         servuid = self.uids.get(irc.name)
         if not servuid:
@@ -293,7 +314,7 @@ class ServiceBot():
 
         irc.reply(text, notice=notice, source=servuid, private=private)
 
-    def error(self, irc, text, notice=False, private=False):
+    def error(self, irc, text, notice=None, private=None):
         """Replies with an error, as the service in question."""
         servuid = self.uids.get(irc.name)
         if not servuid:
@@ -314,8 +335,13 @@ class ServiceBot():
         cmd = cmd_args[0].lower()
         cmd_args = cmd_args[1:]
         if cmd not in self.commands:
-            if not cmd.startswith('\x01'):
-                # Ignore invalid command errors from CTCPs.
+            # XXX: we really need abstraction for this kind of config fetching...
+            show_unknown_cmds = irc.serverdata.get('%s_show_unknown_commands' % self.name,
+                                                   conf.conf.get(self.name, {}).get('show_unknown_commands',
+                                                   conf.conf['pylink'].get('show_unknown_commands', True)))
+
+            if cmd and show_unknown_cmds and not cmd.startswith('\x01'):
+                # Ignore empty commands and invalid command errors from CTCPs.
                 self.reply(irc, 'Error: Unknown command %r.' % cmd)
             log.info('(%s/%s) Received unknown command %r from %s', irc.name, self.name, cmd, irc.getHostmask(source))
             return
@@ -324,7 +350,7 @@ class ServiceBot():
         for func in self.commands[cmd]:
             try:
                 func(irc, source, cmd_args)
-            except NotAuthorizedError as e:
+            except (NotAuthorizedError, InvalidArgumentsError) as e:
                 self.reply(irc, 'Error: %s' % e)
             except Exception as e:
                 log.exception('Unhandled exception caught in command %r', cmd)
@@ -353,6 +379,14 @@ class ServiceBot():
             """
             self.reply(irc, text, private=private)
 
+        def _reply_format(next_line):
+            """
+            Formats and outputs the given line.
+            """
+            next_line = next_line.strip()
+            next_line = NORMALIZEWHITESPACE_RE.sub(' ', next_line)
+            _reply(next_line)
+
         if command not in self.commands:
             _reply('Error: Unknown command %r.' % command)
             return
@@ -373,16 +407,33 @@ class ServiceBot():
                     _reply(args_desc.strip())
                     if not shortform:
                         # Note: we handle newlines in docstrings a bit differently. Per
-                        # https://github.com/GLolol/PyLink/issues/307, only double newlines
-                        # have the effect of showing a new line on IRC. Single newlines
-                        # are stripped so that word wrap can be applied in the source code
-                        # without actually affecting the output on IRC.
-                        for line in doc.replace('\r', '').split('\n\n')[1:]:
-                            _reply(' ')  # Empty line to break up output a bit.
-                            real_line = line.replace('\n', ' ')
-                            real_line = real_line.strip()
-                            real_line = NORMALIZEWHITESPACE_RE.sub(' ', real_line)
-                            _reply(real_line)
+                        # https://github.com/GLolol/PyLink/issues/307, only double newlines (and
+                        # combinations of more) have the effect of showing a new line on IRC.
+                        # Single newlines are stripped so that word wrap can be applied in source
+                        # code without affecting the output on IRC.
+                        # TODO: we should probably verify that the output line doesn't exceed IRC
+                        # line length limits...
+                        next_line = ''
+                        for linenum, line in enumerate(lines[1:], 1):
+                            stripped_line = line.strip()
+                            log.debug("_show_command_help: Current line (%s): %r", linenum, stripped_line)
+                            log.debug("_show_command_help: Last line (%s-1=%s): %r", linenum, linenum-1, lines[linenum-1].strip())
+
+                            if stripped_line:
+                                # If this line has content, join it with the previous one.
+                                next_line += line.rstrip()
+                                next_line += ' '
+                            elif linenum > 0 and not lines[linenum-1].strip():
+                                # The line before us was empty, so treat this one as a legitimate
+                                # newline/break.
+                                log.debug("_show_command_help: Adding an extra break...")
+                                _reply(' ')
+                            else:
+                                # Otherwise, output it to IRC.
+                                _reply_format(next_line)
+                                next_line = ''  # Reset the next line buffer
+                        else:
+                            _reply_format(next_line)
                 else:
                     _reply("Error: Command %r doesn't offer any help." % command)
                     return
@@ -462,14 +513,23 @@ def registerService(name, *args, **kwargs):
     if name in world.services:
         raise ValueError("Service name %s is already bound!" % name)
 
+    # Allow disabling service spawning either globally or by service.
+    elif name != 'pylink' and not (conf.conf.get(name, {}).get('spawn_service',
+            conf.conf['bot'].get('spawn_services', True))):
+        return world.services['pylink']
+
     world.services[name] = sbot = ServiceBot(name, *args, **kwargs)
     sbot.spawn()
     return sbot
 
 def unregisterService(name):
     """Unregisters an existing service bot."""
-    assert name in world.services, "Unknown service %s" % name
     name = name.lower()
+
+    if name not in world.services:
+        # Service bot doesn't exist; ignore.
+        return
+
     sbot = world.services[name]
     for ircnet, uid in sbot.uids.items():
         ircobj = world.networkobjects[ircnet]
@@ -513,3 +573,36 @@ def wrapArguments(prefix, args, length, separator=' ', max_args_per_line=0):
         strings.append(buf)
 
     return strings
+
+class IRCParser(argparse.ArgumentParser):
+    """
+    Wrapper around argparse.ArgumentParser, without quitting on usage errors.
+    """
+    REMAINDER = argparse.REMAINDER
+
+    def print_help(self, *args, **kwargs):
+        # XXX: find a way to somehow route this through IRC
+        raise InvalidArgumentsError("Use help <commandname> to receive help for PyLink commands.")
+
+    def error(self, message, *args, **kwargs):
+        raise InvalidArgumentsError(message)
+    _print_message = error  # XXX: ugly
+
+    def exit(self, *args):
+        return
+
+class DeprecatedAttributesObject():
+    """
+    Object implementing deprecated attributes and warnings on access.
+    """
+    def __init__(self):
+        self.deprecated_attributes = {}
+
+    def __getattribute__(self, attr):
+        # Note: "self.deprecated_attributes" calls this too, so the != check is
+        # needed to prevent a recursive loop!
+        if attr != 'deprecated_attributes' and attr in self.deprecated_attributes:
+            log.warning('Attribute %s.%s is deprecated: %s' % (self.__class__.__name__, attr,
+                        self.deprecated_attributes.get(attr)))
+
+        return object.__getattribute__(self, attr)

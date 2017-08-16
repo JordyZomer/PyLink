@@ -1,6 +1,6 @@
 import time
 
-from pylinkirc import utils
+from pylinkirc import utils, conf
 from pylinkirc.log import log
 from pylinkirc.classes import *
 from pylinkirc.protocols.ts6 import *
@@ -13,6 +13,7 @@ class RatboxProtocol(TS6Protocol):
         self.required_caps.discard('EUID')
 
         self.hook_map['LOGIN'] = 'CLIENT_SERVICES_LOGIN'
+        self.protocol_caps -= {'slash-in-hosts'}
 
     def connect(self):
         """Initializes a connection to a server."""
@@ -25,7 +26,7 @@ class RatboxProtocol(TS6Protocol):
                        '*A': 'beI',
                        '*B': 'k',
                        '*C': 'l',
-                       '*D': 'imnpstr'}
+                       '*D': 'imnpstrS'}
 
         self.irc.umodes = {
             'invisible': 'i', 'callerid': 'g', 'oper': 'o', 'admin': 'a', 'sno_botfloods': 'b',
@@ -58,7 +59,7 @@ class RatboxProtocol(TS6Protocol):
         uid = self.uidgen[server].next_uid()
 
         ts = ts or int(time.time())
-        realname = realname or self.irc.botdata['realname']
+        realname = realname or conf.conf['bot']['realname']
         raw_modes = self.irc.joinModes(modes)
 
         orig_realhost = realhost
@@ -81,7 +82,7 @@ class RatboxProtocol(TS6Protocol):
 
     def updateClient(self, target, field, text):
         """updateClient() stub for ratbox."""
-        raise NotImplementedError
+        raise NotImplementedError("User data changing is not supported on ircd-ratbox.")
 
     def handle_realhost(self, uid, command, args):
         """Handles real host propagation."""

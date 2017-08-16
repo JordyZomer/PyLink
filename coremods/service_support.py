@@ -14,6 +14,11 @@ def spawn_service(irc, source, command, args):
     # Service name
     name = args['name']
 
+    if name != 'pylink' and not irc.proto.hasCap('can-spawn-clients'):
+        log.debug("(%s) Not spawning service %s because the server doesn't support spawning clients",
+                  irc.name, name)
+        return
+
     # Get the ServiceBot object.
     sbot = world.services[name]
 
@@ -25,10 +30,6 @@ def spawn_service(irc, source, command, args):
     # settings, and then falling back to the literal service name.
     nick = irc.serverdata.get("%s_nick" % name) or conf.conf.get(name, {}).get('nick') or sbot.nick or name
     ident = irc.serverdata.get("%s_ident" % name) or conf.conf.get(name, {}).get('ident') or sbot.ident or name
-
-    if name != 'pylink' and irc.protoname == 'clientbot':
-        # Prefix service bots spawned on Clientbot to prevent possible nick collisions.
-        nick = 'PyLinkService@' + nick
 
     # TODO: make this configurable?
     host = irc.hostname()
@@ -47,9 +48,15 @@ def spawn_service(irc, source, command, args):
             modes.append((mode, None))
 
     # Track the service's UIDs on each network.
-    log.debug('(%s) Using nick %s for service %s', irc.name, nick, name)
-    userobj = irc.proto.spawnClient(nick, ident, host, modes=modes, opertype="PyLink Service",
-                                    manipulatable=sbot.manipulatable)
+    log.debug('(%s) spawn_service: Using nick %s for service %s', irc.name, nick, name)
+    u = irc.nickToUid(nick)
+    if u and irc.isInternalClient(u):  # If an internal client exists, reuse it.
+        log.debug('(%s) spawn_service: Using existing client %s/%s', irc.name, u, nick)
+        userobj = irc.users[u]
+    else:
+        log.debug('(%s) spawn_service: Spawning new client %s', irc.name, nick)
+        userobj = irc.proto.spawnClient(nick, ident, host, modes=modes, opertype="PyLink Service",
+                                        manipulatable=sbot.manipulatable)
 
     # Store the service name in the IrcUser object for easier access.
     userobj.service = name
@@ -59,12 +66,11 @@ def spawn_service(irc, source, command, args):
     # Special case: if this is the main PyLink client being spawned,
     # assign this as irc.pseudoclient.
     if name == 'pylink':
-        log.debug('(%s) irc.pseudoclient set to UID %s', irc.name, u)
+        log.debug('(%s) spawn_service: irc.pseudoclient set to UID %s', irc.name, u)
         irc.pseudoclient = userobj
 
-    # TODO: channels should be tracked in a central database, not hardcoded
-    # in conf.
-    channels = set(irc.serverdata.get('channels', [])) | sbot.extra_channels.get(irc.name, set())
+    channels = set(irc.serverdata.get(name+'_channels', [])) | set(irc.serverdata.get('channels', [])) | \
+               sbot.extra_channels.get(irc.name, set())
     sbot.join(irc, channels)
 
 utils.add_hook(spawn_service, 'PYLINK_NEW_SERVICE')
@@ -94,10 +100,18 @@ utils.add_hook(handle_endburst, 'ENDBURST')
 def handle_kill(irc, source, command, args):
     """Handle KILLs to PyLink service bots, respawning them as needed."""
     target = args['target']
+    userdata = args.get('userdata')
     sbot = irc.getServiceBot(target)
-    if sbot:
-        spawn_service(irc, source, command, {'name': sbot.name})
-        return
+    servicename = None
+
+    if userdata and hasattr(userdata, 'service'):  # Look for the target's service name attribute
+        servicename = userdata.service
+    elif sbot:  # Or their service bot instance
+        servicename = sbot.name
+    if servicename:
+        log.debug('(%s) services_support: respawning service %s after KILL.', irc.name, servicename)
+        spawn_service(irc, source, command, {'name': servicename})
+
 utils.add_hook(handle_kill, 'KILL')
 
 def handle_kick(irc, source, command, args):
@@ -121,11 +135,7 @@ def handle_commands(irc, source, command, args):
 utils.add_hook(handle_commands, 'PRIVMSG')
 
 # Register the main PyLink service. All command definitions MUST go after this!
-mynick = conf.conf['bot'].get("nick", "PyLink")
-myident = conf.conf['bot'].get("ident", "pylink")
-
 # TODO: be more specific, and possibly allow plugins to modify this to mention
 # their features?
-mydesc = "\x02%s\x02 provides extended network services for IRC." % mynick
-
-utils.registerService('pylink', nick=mynick, ident=myident, desc=mydesc, manipulatable=True)
+mydesc = "\x02PyLink\x02 provides extended network services for IRC."
+utils.registerService('pylink', desc=mydesc, manipulatable=True)

@@ -58,16 +58,18 @@ if __name__ == '__main__':
     if not args.no_pid:
         with open('%s.pid' % conf.confname, 'w') as f:
             f.write(str(os.getpid()))
+        world._should_remove_pid = True
 
     # Import plugins first globally, because they can listen for events
     # that happen before the connection phase.
     to_load = conf.conf['plugins']
+    utils.resetModuleDirs()
     # Here, we override the module lookup and import the plugins
     # dynamically depending on which were configured.
     for plugin in to_load:
         try:
             world.plugins[plugin] = pl = utils.loadPlugin(plugin)
-        except (OSError, ImportError) as e:
+        except Exception as e:
             log.exception('Failed to load plugin %r: %s: %s', plugin, type(e).__name__, str(e))
         else:
             if hasattr(pl, 'main'):
@@ -90,4 +92,4 @@ if __name__ == '__main__':
     log.info("Loaded plugins: %s", ', '.join(sorted(world.plugins.keys())))
 
     from pylinkirc import coremods
-    coremods.permissions.resetPermissions()
+    coremods.permissions.resetPermissions()  # XXX we should probably move this to run on import

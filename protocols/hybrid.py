@@ -1,6 +1,6 @@
 import time
 
-from pylinkirc import utils
+from pylinkirc import utils, conf
 from pylinkirc.log import log
 from pylinkirc.classes import *
 from pylinkirc.protocols.ts6 import *
@@ -14,6 +14,7 @@ class HybridProtocol(TS6Protocol):
         self.caps = {}
         self.hook_map = {'EOB': 'ENDBURST', 'TBURST': 'TOPIC', 'SJOIN': 'JOIN'}
         self.has_eob = False
+        self.protocol_caps -= {'slash-in-hosts'}
 
     def connect(self):
         """Initializes a connection to a server."""
@@ -79,7 +80,7 @@ class HybridProtocol(TS6Protocol):
         f('CAPAB :TBURST DLN KNOCK UNDLN UNKLN KLN ENCAP IE EX HOPS CHW SVS CLUSTER EOB QS')
 
         f('SERVER %s 0 :%s' % (self.irc.serverdata["hostname"],
-                               self.irc.serverdata.get('serverdesc') or self.irc.botdata['serverdesc']))
+                               self.irc.serverdata.get('serverdesc') or conf.conf['bot']['serverdesc']))
 
         # send endburst now
         self.irc.send(':%s EOB' % (self.irc.sid,))
@@ -101,7 +102,7 @@ class HybridProtocol(TS6Protocol):
         uid = self.uidgen[server].next_uid()
 
         ts = ts or int(time.time())
-        realname = realname or self.irc.botdata['realname']
+        realname = realname or conf.conf['bot']['realname']
         realhost = realhost or host
         raw_modes = self.irc.joinModes(modes)
         u = self.irc.users[uid] = IrcUser(nick, ts, uid, server, ident=ident, host=host, realname=realname,
@@ -168,7 +169,7 @@ class HybridProtocol(TS6Protocol):
         """
         # <- :0UY UID dan 1 1451041551 +Facdeiklosuw ~ident localhost 127.0.0.1 0UYAAAAAB * :realname
         nick = args[0]
-        self.checkCollision(nick)
+        self.check_nick_collision(nick)
         ts, modes, ident, host, ip, uid, account, realname = args[2:10]
         if account == '*':
             account = None

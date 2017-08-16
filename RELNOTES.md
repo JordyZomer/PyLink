@@ -1,3 +1,129 @@
+# PyLink 1.2.0
+The "Dragons" release. Changes since 1.2.0-rc1:
+
+#### Feature changes
+- Make relay nick tagging configurable per-network; backported from 2.0-dev (#494)
+
+#### Bug fixes
+
+- Fix extraneous removal of PID files even when `-n/--no-check-pid` was set or if the PID file already existed on launch (PyLink would quit and delete the old PID file in these cases)
+- servprotect: bump default threshold up to 10 hits/10 seconds, as the old limit was too prone to false positives
+- Fix extraneous queue threads not being stopped when a network disconnects (0d5afd2)
+- Fix relay errors on disconnect due to race conditions in network handling (a0a295f)
+
+#### Misc changes
+- Updated example config and FAQ.
+
+For a summary of major changes since 1.1.x, see the changelog for 1.2.0-rc1.
+
+# PyLink 1.2.0-rc1
+
+The "Droplet" release. Changes since 1.2-beta1:
+
+#### Bug fixes
+- relay: fix channel claim disabling (i.e. "`CLAIM #channel -`" was broken since 1.2-alpha1)
+- IRCS2SProtocol: fix `UnboundLocalError` in "message coming from wrong way" error
+- ts6: fix parsing of the `INVITE` command's `ts` argument
+- automode: fix formatting and examples in `setacc` help text
+- p10: fix rejoin-on-kick relaying by also acknowledging kicks sent from PyLink to its clients with a PART
+
+### Major changes since 1.1.x
+- Added support for snircd, ircu, and other (generic) P10 variants. The target IRCd can be chosen using the new server-specific `p10_ircd` option; see the example config for details (#330).
+- **The `nefarious` protocol module was renamed to `p10`**, as it is no longer Nefarious-specific. You should update your configuration to use the new name!
+- **Certain configuration options were renamed / deprecated:**
+    - The `bot:` configuration block was renamed to `pylink:`, with the old name now deprecated.
+    - `logging:stdout` is now `logging:console` (the previous name was a misnomer since text actually went to `stderr`).
+    - The `bot:prefix` option is deprecated: you should instead define the `prefixes` setting in a separate config block for each service you wish to customize (e.g. set `automode:prefix` and `games:prefix`)
+- **Using new-style accounts exclusively (i.e. specifying things under `login:accounts`) now requires a `permissions:` block for PyLink to start** (#413).
+- New `stats` (uptime info) and `global` (global announcement) plugins.
+- Plugins and protocol modules can now be loaded from any directory, using the new `plugin_dirs` and `protocol_dirs` options. (#350)
+    - The `pylink-contribdl` utility was dropped as it is now it obsolete.
+- Relay message formatting became more flexible, and messages from servers (e.g. spurious invite announcements) can now be dropped: look for the `relay_weird_senders` and `accept_weird_senders` options.
+- Relay now forbids linking to channels where the home network is down, which previously caused errors due to unreliable target TS (#419). This, along with the regular TS check, can be overridden with a new `link --force` option.
+- The `remote` command now routes replies back to the caller network, and supports service bots that aren't the main PyLink bot via a `--service` option.
+- Service bot spawning can now be disabled via the global `spawn_services` and per-service `spawn_service` options; doing so will merge the relevant commands into the main PyLink bot.
+- Added a `pylink::show_unknown_commands` option to optionally disable "unknown command" errors. This option can also be overridden per-server and per-service (#441).
+- Added a `pylink::prefer_private_replies` option to default to private command replies (#409).
+- Relay can now announce to leaf channels when the home network disconnects; see the `relay::disconnect_announcement` option (#421).
+
+For a full list of changes since 1.1.x, consult the changelogs for the 1.2.x beta and alpha releases below.
+
+# PyLink 1.2-beta1
+The "Dynamo" release. This release includes all fixes from 1.1.2, plus the following:
+
+#### Feature changes
+- Added configurable encoding support via the `encoding` option in server config blocks ([#467](https://github.com/GLolol/PyLink/pull/467)).
+- **Certain configuration options were renamed / deprecated:**
+    - The `bot:` configuration block was renamed to `pylink:`, with the old name now deprecated.
+    - `logging:stdout` is now `logging:console` (the previous name was a misnomer since text actually went to `stderr`).
+    - The `bot:prefix` option is deprecated: you should instead define the `prefixes` setting in a separate config block for each service you wish to customize (e.g. set `automode:prefix` and `games:prefix`)
+- Added new `$and` and `$network` exttargets - see the new [exttargets documentation page](https://github.com/GLolol/PyLink/blob/1.2-beta1/docs/exttargets.md) for how to use them.
+- Hostmasks can now be negated in ban matching: e.g. `!*!*@localhost` now works. Previously, this negation was limited to exttargets only.
+- `relay_clientbot` no longer colours network names by default. It is still possible to restore the old behaviour by defining [custom clientbot styles](https://github.com/GLolol/PyLink/blob/1.2-beta1/docs/advanced-relay-config.md#custom-clientbot-styles).
+- `relay_clientbot` no longer uses dark blue as a random colour choice, as it is difficult to read on clients with dark backgrounds.
+
+#### Bug fixes
+- Fix service respawn on KILL not working at all - this was likely broken for a while but never noticed...
+- Fix kick-on-rejoin not working on P10 IRCds when `joinmodes` is set. (a.k.a. acknowledge incoming KICKs with a PART per [the P10 specification](https://github.com/evilnet/nefarious2/blob/ed12d64/doc/p10.txt#L611-L618))
+- servprotect: only track kills and saves to PyLink clients, not all kills on a network!
+- Fix `~#channel` prefix messages not working over relay on RFC1459-casemapping networks ([#464](https://github.com/GLolol/PyLink/issues/464)).
+- Show errors when trying to use `showchan` on a secret channel in the same way as actually non-existent channels. Previously this error response forced replies as a private notice, potentially leaking the existence of secret/private channels.
+- example-conf: fix reversed description for the password encryption setting.
+
+#### Internal changes
+- Portions of the IRC/relay stack were refactored to prevent various hangs on shutdown.
+- Performance improvements for outgoing message queuing: the queue system now blocks when no messages are in the queue instead of polling it multiple times a minute.
+- Logging fixes: startup warnings (e.g. from config deprecations) now log to files as well as the console.
+
+# PyLink 1.2-alpha1
+The "Darkness" release. This release includes all fixes from 1.1.2, plus the following summary of changes:
+
+#### Feature changes
+- **Added support for snircd, ircu, and other (generic) P10 variants.** The target IRCd can be chosen using the new server-specific `p10_ircd` option; see the example config for details (#330).
+- **The `nefarious` protocol module was renamed to `p10` - you should update your configuration to use the new name!**
+- Plugins and protocol modules can now be loaded from any directory, making pylink-contrib 20% more useful! Look for the `plugin_dirs` and `protocol_dirs` options in the example config. (#350)
+    - The `pylink-contribdl` utility was dropped as this makes it obsolete.
+- Relay now forbids linking to channels where the home network is down, which previously caused errors due to unreliable target TS (#419). This, along with the regular TS check, can be overridden with a new `link --force` option.
+- SASL timeout for clientbot is now configurable, with the default raised to 15 seconds
+- **New-style accounts (i.e. anything under `login:accounts`) now require a `permissions:` block for PyLink to start** (#413).
+- New `stats` (uptime info) and `global` (global announcement) plugins
+- Improvements to the `remote` command of the `networks` plugin:
+    - Plugin replies are now routed back to the sender's network.
+    - Added an optional `--service` option to call commands for service bots other than the main PyLink service.
+- `servprotect` KILL/SAVE limits and expiry time are now configurable (#417)
+- Added the `pylink::show_unknown_commands` option to optionally disable "unknown command" errors. This option can also be overridden per-server and per-service (#441).
+- Added the `pylink::prefer_private_replies` option to default to private command replies (#409)
+- Relay message formatting became more flexible, and messages from user-less senders can now be dropped (fa30d3c c03f2d7)
+- Added global and per-service `spawn_service(s)` options to optionally disable service bot spawning
+- The `bots` plugin now allows specifying channel prefixes (e.g. `@+`) in `join`
+- exec: Added `iexec`, `ieval`, `peval`, `pieval`: `i`\* commands run code in an isolated, persistent local scope, while `p`\* commands evaluate expressions while pretty-printing the output
+- Relay: implement optional network disconnect announcements (see the `relay::disconnect_announcement` option; #421)
+
+#### Bug fixes
+- Service bots no longer throw errors when attempting to call empty commands via fantasy.
+- Protocol modules now send PONG immediately instead of queuing it, which should prevent ping timeouts at times of very high activity.
+
+#### Internal improvements
+- Protocols now verify that incoming messages originate from the right direction (#405)
+- `Irc.matchHost` now supports matching CIDR ranges (#411)
+- Added an `utils.IRCParser` class based off `argparse`, for flexible argument parsing (#6).
+- Rewrote outgoing message queues to use `queue.Queue` (#430), and support a limit to the amount of queued lines (#442)
+   - Also, added a `clearqueue` command to force clear the queue on a network.
+- PyLink protocol capabilities were introduced, reducing the amount of protocol name hardcoding in plugins (#337)
+- Service bots no longer create stubs on Clientbot networks, and instead route replies through the main bot (#403)
+- The default throttle time was halved from 0.01s to 0.005s.
+- ServiceBot is now more flexible in help formatting, fixing indented lines and consecutive newlines not showing on IRC.
+- Configuration validation no longer uses skippable asserts (#414)
+- inspircd: better support for OPERTYPE on InspIRCd 3.x
+- Clientbot now tracks channel modes and channel TS on join.
+- Clientbot now generates PUIDs/PSIDs with the nick or server name as prefix, and checks to make sure incoming senders don't clash with one.
+- commands: `showchan` now shows TS on connections without the `has-ts` protocol capability as well, even though this value may be unreliable
+
+#### Misc changes
+- The `bot:` config block is renamed to `pylink:`. Existing configurations will still work, as the `bot` and `pylink` blocks are always merged together (#343).
+- Added better documentation for generic options available to all service bots (`nick`, `ident`, `prefix` for fantasy, etc.)
+- `Irc.botdata`, `Irc.conf`, `Irc.checkAuthenticated()` have been deprecated: use `conf.conf['pylink']`, `conf.conf`, and the permissions API respectively instead!
+
 # PyLink 1.1.2
 
 The "Calamari" release.
@@ -461,7 +587,7 @@ Tagged as **0.9-beta1** by [GLolol](https://github.com/GLolol) on 2016-07-14T02:
 - protocols/unreal: fix server name of the uplink server not being saved (#268)
 - Channel prefixes are now sorted in WHOIS output (i.e. no more wrong `@~#channel`), and only the highest prefix shown
 - Fixed issues in internal channel mode tracking (c1cd6f4 58d71b0)
-- WHOIS requests to the PyLink server for clients that aren't PyLink bots now work (syntax: `/raw whois pylink.server somenick`). "No such nick" errors are also sent when the target is missing, instead of raising warnings. 
+- WHOIS requests to the PyLink server for clients that aren't PyLink bots now work (syntax: `/raw whois pylink.server somenick`). "No such nick" errors are also sent when the target is missing, instead of raising warnings.
     - These WHOIS responses were previously sent from the wrong source (the server that the client was on, instead of the PyLink server), causing them to be ignored if they were going the wrong way.
 - Automode now treat channels case insensitively in `delacc`.
 - `ascii` and `rfc1459` case mappings now treat Unicode case sensitively, in the same way an IRCd would.
@@ -488,7 +614,7 @@ Tagged as **0.9-alpha1** by [GLolol](https://github.com/GLolol) on 2016-07-09T07
 - Relay can now handle messages sent by users not in a target channel (e.g. for channels marked `-n`)
 - Relay subserver spawning is now always on - the `spawn_servers` option is removed
 - Relay can now optionally show netsplits from remote networks, using a `show_netsplits` option in the `relay:` block
-- The `channels` configuration option in `server:` blocks is now optional, and defaults to no channels if not specified 
+- The `channels` configuration option in `server:` blocks is now optional, and defaults to no channels if not specified
 - The `maxnicklen` configuration option is also now optional, with a default value of 30 characters.
 - `--version`, `--no-pid`, and `--help` are now implemented by PyLink's command line script
 - Test cases were dropped - they were broken and poorly maintained.
@@ -572,7 +698,7 @@ Tagged as **0.8-alpha1** by [GLolol](https://github.com/GLolol) on 2016-04-23T03
 - Track user IPs of UnrealIRCd 3.2 users (#196)
 - SIGHUP now rehashes PyLink on supported platforms (#179)
 - Improved mode support for Charybdis (#203)
-- Fix disconnect logic during ping timeouts 
+- Fix disconnect logic during ping timeouts
 
 [Full diff](https://github.com/GLolol/PyLink/compare/0.7.2-dev...0.8-alpha1)
 
@@ -901,14 +1027,14 @@ Tagged as **0.3.1-dev** by [GLolol](https://github.com/GLolol) on 2015-09-03T06:
 
 Bugfix release + LINKACL support for relay. [Commits since 0.3.0-dev](https://github.com/GLolol/PyLink/compare/0.3.0-dev...0.3.1-dev):
 
-043fccf4470bfbc8041056f5dbb694be079a45a5 Fix previous commit (Closes #100) 
+043fccf4470bfbc8041056f5dbb694be079a45a5 Fix previous commit (Closes #100)
 708d94916477f53ddc79a90c4ff321f636c01348 relay: join remote users before sending ours
-8d44830d5c5b12abd6764038d7e9983998acdfc6 relay.handle_kill: prevent yet another RuntimeError 
-6d6606900e2df60eb8055da0e4452a560c7510b5 relay: coerse "/" to "|" in nicks if "/" isn't present in the separator 
-c8e7b72065b2686c9691b276989ee948023ffe4d protocols: lowercase channel names in PRIVMSG handling 
-37eecd7d69cec794186024bf715a8ba55902d0e8 pr/inspircd: use OPERTYPE to oper up clients correctly, and handle the metadata accordingly 9f0f4cb1246c95335f42a24f7c5016175e6fba66 relay: burst the right set of modes 
-7620cd7433d9dc53dda1bdb06f6a9c673757f1f6 pr/inspircd: fix compatibility with channel mode +q (~) 
-3523f8f7663e618829dccfbec6eccfaf0ec87cc5 LINKACL support 
+8d44830d5c5b12abd6764038d7e9983998acdfc6 relay.handle_kill: prevent yet another RuntimeError
+6d6606900e2df60eb8055da0e4452a560c7510b5 relay: coerse "/" to "|" in nicks if "/" isn't present in the separator
+c8e7b72065b2686c9691b276989ee948023ffe4d protocols: lowercase channel names in PRIVMSG handling
+37eecd7d69cec794186024bf715a8ba55902d0e8 pr/inspircd: use OPERTYPE to oper up clients correctly, and handle the metadata accordingly 9f0f4cb1246c95335f42a24f7c5016175e6fba66 relay: burst the right set of modes
+7620cd7433d9dc53dda1bdb06f6a9c673757f1f6 pr/inspircd: fix compatibility with channel mode +q (~)
+3523f8f7663e618829dccfbec6eccfaf0ec87cc5 LINKACL support
 51389b96e26224aab262b7b090032d0b745e9590 relay: LINKACL command (Closes #88)
 
 # [PyLink 0.2.5-dev](https://github.com/GLolol/PyLink/releases/tag/0.2.5-dev)
@@ -946,7 +1072,7 @@ Full diff: https://github.com/GLolol/PyLink/compare/0.2.2-dev...0.2.3-dev
 # [PyLink 0.2.2-dev](https://github.com/GLolol/PyLink/releases/tag/0.2.2-dev)
 Tagged as **0.2.2-dev** by [GLolol](https://github.com/GLolol) on 2015-07-24T18:09:44Z
 
-The "please don't break again :( " release. 
+The "please don't break again :( " release.
 
 - Added `WHOIS` handling support for TS6 IRCds.
 - ts6: fix handling of `SID`, `CHGHOST`, and `SQUIT` commands.
@@ -1001,7 +1127,7 @@ Tagged as **0.1.5-dev** by [GLolol](https://github.com/GLolol) on 2015-07-18T20:
 - Send PING to our uplink periodically, and quit if we don't get a response (#42, #57)
     - New server `pingfreq` option is introduced to set the time between PINGs.
 - relay: Only spawn clients if they share a channel, and quit them when they leave all shared channels (cf32461)
-- Support autoreconnecting to networks! A new `autoconnect` server setting is added to set autoconnect delay. 
+- Support autoreconnecting to networks! A new `autoconnect` server setting is added to set autoconnect delay.
 - New `PYLINK_DISCONNECT` hook to keep track of network disconnections (3f6f78b)
 - relay: add a `LINKED` command (#65, bbcd70b)
 - commands: add a `HELP` command (#8, 6508cb3 4553eda)

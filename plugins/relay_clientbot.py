@@ -1,24 +1,22 @@
 # relay_clientbot.py: Clientbot extensions for Relay
 import string
-import collections
 import time
-import hashlib
 
 from pylinkirc import utils, conf, world
 from pylinkirc.log import log
 
-# TODO: document configurable styles in relay::clientbot_styles::COMMAND_NAME
+# Clientbot default styles:
 # These use template strings as documented @ https://docs.python.org/3/library/string.html#template-strings
-default_styles = {'MESSAGE': '\x02[$colored_netname]\x02 <$colored_sender> $text',
-                  'KICK': '\x02[$colored_netname]\x02 - $colored_sender$sender_identhost has kicked $target_nick from $channel ($text)',
-                  'PART': '\x02[$colored_netname]\x02 - $colored_sender$sender_identhost has left $channel ($text)',
-                  'JOIN': '\x02[$colored_netname]\x02 - $colored_sender$sender_identhost has joined $channel',
-                  'NICK': '\x02[$colored_netname]\x02 - $colored_sender$sender_identhost is now known as $newnick',
-                  'QUIT': '\x02[$colored_netname]\x02 - $colored_sender$sender_identhost has quit ($text)',
-                  'ACTION': '\x02[$colored_netname]\x02 * $colored_sender $text',
-                  'NOTICE': '\x02[$colored_netname]\x02 - Notice from $colored_sender: $text',
-                  'SQUIT': '\x02[$colored_netname]\x02 - Netsplit lost users: $colored_nicks',
-                  'SJOIN': '\x02[$colored_netname]\x02 - Netjoin gained users: $colored_nicks',
+default_styles = {'MESSAGE': '\x02[$netname]\x02 <$colored_sender> $text',
+                  'KICK': '\x02[$netname]\x02 - $colored_sender$sender_identhost has kicked $target_nick from $channel ($text)',
+                  'PART': '\x02[$netname]\x02 - $colored_sender$sender_identhost has left $channel ($text)',
+                  'JOIN': '\x02[$netname]\x02 - $colored_sender$sender_identhost has joined $channel',
+                  'NICK': '\x02[$netname]\x02 - $colored_sender$sender_identhost is now known as $newnick',
+                  'QUIT': '\x02[$netname]\x02 - $colored_sender$sender_identhost has quit ($text)',
+                  'ACTION': '\x02[$netname]\x02 * $colored_sender $text',
+                  'NOTICE': '\x02[$netname]\x02 - Notice from $colored_sender: $text',
+                  'SQUIT': '\x02[$netname]\x02 - Netsplit lost users: $colored_nicks',
+                  'SJOIN': '\x02[$netname]\x02 - Netjoin gained users: $colored_nicks',
                   'PM': 'PM from $sender on $netname: $text',
                   'PNOTICE': '<$sender> $text',
                   }
@@ -27,8 +25,7 @@ def color_text(s):
     """
     Returns a colorized version of the given text based on a simple hash algorithm.
     """
-    colors = ('02', '03', '04', '05', '06', '07', '08', '09', '10', '11',
-              '12', '13', '15')
+    colors = ('03', '04', '05', '06', '07', '08', '09', '10', '11', '12', '13', '15')
     hash_output = hash(s.encode())
     num = hash_output % len(colors)
     return "\x03%s%s\x03" % (colors[num], s)
@@ -163,7 +160,7 @@ def cb_relay_core(irc, source, command, args):
                 if nicklist:
 
                     # Get channel-specific nick list if relevent.
-                    if type(nicklist) == collections.defaultdict:
+                    if isinstance(nicklist, dict):
                         nicklist = nicklist.get(target, [])
 
                     # Ignore if no nicks are affected on the channel.
@@ -204,7 +201,7 @@ def rpm(irc, source, args):
         return
 
     relay = world.plugins.get('relay')
-    if irc.protoname != 'clientbot':
+    if irc.proto.hasCap('can-spawn-clients'):
         irc.error('This command is only supported on Clientbot networks. Try /msg %s <text>' % target)
         return
     elif relay is None:

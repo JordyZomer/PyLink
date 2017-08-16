@@ -21,7 +21,7 @@ def account(irc, host, uid):
 
     $account -> Returns True (a match) if the target is registered.
     $account:accountname -> Returns True if the target's account name matches the one given, and the
-    target is connected to the local network..
+    target is connected to the local network.
     $account:accountname:netname -> Returns True if both the target's account name and origin
     network name match the ones given.
     $account:*:netname -> Matches all logged in users on the given network.
@@ -144,3 +144,49 @@ def pylinkacc(irc, host, uid):
     elif len(groups) == 2:
         # Second scenario. Return True if the user's login matches the one given.
         return login == groups[1]
+
+@bind
+def network(irc, host, uid):
+    """
+    $network exttarget handler. This exttarget takes one argument: a network name, and returns
+    a match for all users on that network.
+
+    Note: network names are case sensitive.
+    """
+    try:
+        targetnet = host.split(':')[1]
+    except IndexError:  # No network arg given, bail.
+        return False
+
+    userobj = irc.users[uid]
+    if hasattr(userobj, 'remote'):
+        # User is a PyLink Relay client; set the correct network name.
+        homenet = userobj.remote[0]
+    else:
+        homenet = irc.name
+
+    return homenet == targetnet
+
+# Note: "and" can't be a function name so we use this.
+def exttarget_and(irc, host, uid):
+    """
+    $and exttarget handler. This exttarget takes a series of exttargets (or hostmasks) joined with
+    a "+", and returns True if all sub exttargets match.
+
+    Examples:
+    $and:($ircop:*admin*+$network:ovd) -> Matches all opers on the network ovd.
+    $and:($account+$pylinkirc) -> Matches all users logged in to both services and PyLink.
+    $and:(*!*@localhost+$ircop) -> Matches all opers with the host `localhost`.
+    $and:(*!*@*.mibbit.com+!$ircop+!$account) -> Matches all mibbit users that aren't opered or logged in to services.
+    """
+    targets = host.split(':', 1)[-1]
+    # For readability, this requires that the exttarget list be wrapped in brackets.
+    if not (targets.startswith('(') and targets.endswith(')')):
+        return False
+
+    targets = targets[1:-1]
+    targets = list(filter(None, targets.split('+')))
+    log.debug('exttargets_and: using raw subtargets list %r (original query=%r)', targets, host)
+    # Wrap every subtarget into irc.matchHost and return True if all subtargets return True.
+    return all(map(lambda sub_exttarget: irc.matchHost(sub_exttarget, uid), targets))
+world.exttarget_handlers['and'] = exttarget_and

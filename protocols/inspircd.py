@@ -5,7 +5,7 @@ inspircd.py: InspIRCd 2.x protocol module for PyLink.
 import time
 import threading
 
-from pylinkirc import utils
+from pylinkirc import utils, conf
 from pylinkirc.classes import *
 from pylinkirc.log import log
 from pylinkirc.protocols.ts6_common import *
@@ -13,6 +13,9 @@ from pylinkirc.protocols.ts6_common import *
 class InspIRCdProtocol(TS6BaseProtocol):
     def __init__(self, irc):
         super().__init__(irc)
+
+        self.protocol_caps |= {'slash-in-nicks', 'slash-in-hosts', 'underscore-in-hosts'}
+
         # Set our case mapping (rfc1459 maps "\" and "|" together, for example).
         self.casemapping = 'rfc1459'
 
@@ -47,7 +50,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         uid = self.uidgen[server].next_uid()
 
         ts = ts or int(time.time())
-        realname = realname or self.irc.botdata['realname']
+        realname = realname or conf.conf['bot']['realname']
         realhost = realhost or host
         raw_modes = self.irc.joinModes(modes)
         u = self.irc.users[uid] = IrcUser(nick, ts, uid, server, ident=ident, host=host, realname=realname,
@@ -174,7 +177,17 @@ class InspIRCdProtocol(TS6BaseProtocol):
         log.debug('(%s) Sending OPERTYPE from %s to oper them up.',
                   self.irc.name, target)
         userobj.opertype = otype
-        self._send(target, 'OPERTYPE %s' % otype.replace(" ", "_"))
+
+        # InspIRCd 2.x uses _ in OPERTYPE to denote spaces, while InspIRCd 3.x does not. This is not
+        # backwards compatible: spaces in InspIRCd 2.x will cause the oper type to get cut off at
+        # the first word, while underscores in InspIRCd 3.x are shown literally as _.
+        # We can do the underscore fixing based on the version of our uplink:
+        if self.remote_proto_ver < 1205:
+            otype = otype.replace(" ", "_")
+        else:
+            otype = ':' + otype
+
+        self._send(target, 'OPERTYPE %s' % otype)
 
     def mode(self, numeric, target, modes, ts=None):
         """Sends mode changes from a PyLink client/server."""
@@ -341,7 +354,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         uplink = uplink or self.irc.sid
         name = name.lower()
         # "desc" defaults to the configured server description.
-        desc = desc or self.irc.serverdata.get('serverdesc') or self.irc.botdata['serverdesc']
+        desc = desc or self.irc.serverdata.get('serverdesc') or conf.conf['bot']['serverdesc']
         if sid is None:  # No sid given; generate one!
             sid = self.sidgen.next_sid()
         assert len(sid) == 3, "Incorrect SID length"
@@ -357,12 +370,18 @@ class InspIRCdProtocol(TS6BaseProtocol):
         self._send(uplink, 'SERVER %s * 1 %s :%s' % (name, sid, desc))
         self.irc.servers[sid] = IrcServer(uplink, name, internal=True, desc=desc)
 
-        endburstf = lambda: self._send(sid, 'ENDBURST')
-        if endburst_delay:
+        def endburstf():
             # Delay ENDBURST by X seconds if requested.
-            threading.Timer(endburst_delay, endburstf, ()).start()
+            if self.irc.aborted.wait(endburst_delay):
+                # We managed to catch the abort flag before sending ENDBURST, so break
+                log.debug('(%s) stopping endburstf() for %s as aborted was set', self.irc.name, sid)
+                return
+            self._send(sid, 'ENDBURST')
+
+        if endburst_delay:
+            threading.Thread(target=endburstf).start()
         else:  # Else, send burst immediately
-            endburstf()
+            self._send(sid, 'ENDBURST')
         return sid
 
     def squit(self, source, target, text='No reason given'):
@@ -388,7 +407,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         host = self.irc.serverdata["hostname"]
         f('SERVER {host} {Pass} 0 {sid} :{sdesc}'.format(host=host,
           Pass=self.irc.serverdata["sendpass"], sid=self.irc.sid,
-          sdesc=self.irc.serverdata.get('serverdesc') or self.irc.botdata['serverdesc']))
+          sdesc=self.irc.serverdata.get('serverdesc') or conf.conf['bot']['serverdesc']))
 
         self._send(self.irc.sid, 'BURST %s' % ts)
         # InspIRCd sends VERSION data on link, instead of whenever requested by a client.
@@ -462,7 +481,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
             log.debug("(%s) capabilities list: %s", self.irc.name, caps)
 
             # Check the protocol version
-            protocol_version = int(caps['PROTOCOL'])
+            self.remote_proto_ver = protocol_version = int(caps['PROTOCOL'])
 
             if protocol_version < self.min_proto_ver:
                 raise ProtocolError("Remote protocol version is too old! "
@@ -471,7 +490,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
                                                           protocol_version))
             elif protocol_version > self.max_proto_ver:
                 log.warning("(%s) PyLink support for InspIRCd 2.2+ is experimental, "
-                            "and should not be relied upon for anything major.",
+                            "and should not be relied upon for anything important.",
                             self.irc.name)
 
             # Store the max nick and channel lengths
@@ -505,7 +524,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         # <- :70M PING 70M 0AL
         # -> :0AL PONG 0AL 70M
         if self.irc.isInternalServer(args[1]):
-            self._send(args[1], 'PONG %s %s' % (args[1], source))
+            self._send(args[1], 'PONG %s %s' % (args[1], source), queue=False)
 
     def handle_fjoin(self, servernumeric, command, args):
         """Handles incoming FJOIN commands (InspIRCd equivalent of JOIN/SJOIN)."""
@@ -556,7 +575,7 @@ class InspIRCdProtocol(TS6BaseProtocol):
         """Handles incoming UID commands (user introduction)."""
         # :70M UID 70MAAAAAB 1429934638 GL 0::1 hidden-7j810p.9mdf.lrek.0000.0000.IP gl 0::1 1429934638 +Wioswx +ACGKNOQXacfgklnoqvx :realname
         uid, ts, nick, realhost, host, ident, ip = args[0:7]
-        self.checkCollision(nick)
+        self.check_nick_collision(nick)
         realname = args[-1]
         self.irc.users[uid] = userobj = IrcUser(nick, ts, uid, numeric, ident, host, realname, realhost, ip)
 

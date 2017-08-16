@@ -14,7 +14,7 @@ def main(irc=None):
     # Register our permissions.
     permissions.addDefaultPermissions(default_permissions)
 
-def die(irc):
+def die(irc=None):
     """Commands plugin die function, called on plugin unload."""
     permissions.removeDefaultPermissions(default_permissions)
 
@@ -99,7 +99,7 @@ def showchan(irc, source, args):
     secret = ('s', None) in c.modes
     if secret and not verbose:
         # Hide secret channels from normal users.
-        irc.error('Unknown channel %r.' % channel, private=True)
+        irc.error('Unknown channel %r.' % channel)
         return
 
     nicks = [irc.users[u].nick for u in c.users]
@@ -108,9 +108,9 @@ def showchan(irc, source, args):
     if c.topic:
         f('\x02Channel topic\x02: %s' % c.topic)
 
-    if irc.protoname != 'clientbot':
-        # Clientbot-specific hack: don't show channel TS because it's not properly tracked.
-        f('\x02Channel creation time\x02: %s (%s)' % (ctime(c.ts), c.ts))
+    # Mark TS values as untrusted on Clientbot and others (where TS is read-only or not trackable)
+    f('\x02Channel creation time\x02: %s (%s)%s' % (ctime(c.ts), c.ts,
+                                                    ' [UNTRUSTED]' if not irc.proto.hasCap('has-ts') else ''))
 
     # Show only modes that aren't list-style modes.
     modes = irc.joinModes([m for m in c.modes if m[0] not in irc.cmodes['*A']], sort=True)
@@ -209,10 +209,10 @@ def loglevel(irc, source, args):
             irc.error('Unknown log level "%s".' % level)
             return
         else:
-            world.stdout_handler.setLevel(loglevel)
+            world.console_handler.setLevel(loglevel)
             irc.reply("Done.")
     except IndexError:
-        irc.reply(world.stdout_handler.level)
+        irc.reply(world.console_handler.level)
 
 @utils.add_cmd
 def mkpasswd(irc, source, args):

@@ -5,7 +5,7 @@ ts6_common.py: Common base protocol class with functions shared by the UnrealIRC
 import string
 import time
 
-from pylinkirc import utils, structures
+from pylinkirc import utils, structures, conf
 from pylinkirc.classes import *
 from pylinkirc.log import log
 from pylinkirc.protocols.ircs2s_common import *
@@ -109,9 +109,9 @@ class TS6BaseProtocol(IRCS2SProtocol):
         # SID generator for TS6.
         self.sidgen = TS6SIDGenerator(irc)
 
-    def _send(self, source, msg):
+    def _send(self, source, msg, **kwargs):
         """Sends a TS6-style raw command from a source numeric to the self.irc connection given."""
-        self.irc.send(':%s %s' % (source, msg))
+        self.irc.send(':%s %s' % (source, msg), **kwargs)
 
     def _expandPUID(self, uid):
         """
@@ -229,9 +229,10 @@ class TS6BaseProtocol(IRCS2SProtocol):
         self._send(numeric, 'PRIVMSG %s :%s' % (target, text))
 
     def notice(self, numeric, target, text):
-        """Sends a NOTICE from a PyLink client."""
-        if not self.irc.isInternalClient(numeric):
-            raise LookupError('No such PyLink client exists.')
+        """Sends a NOTICE from a PyLink client or server."""
+        if (not self.irc.isInternalClient(numeric)) and \
+                (not self.irc.isInternalServer(numeric)):
+            raise LookupError('No such PyLink client/server exists.')
 
         # Mangle message targets for IRCds that require it.
         target = self._expandPUID(target)
@@ -259,7 +260,7 @@ class TS6BaseProtocol(IRCS2SProtocol):
         # -> :0AL SID test.server 1 0XY :some silly pseudoserver
         uplink = uplink or self.irc.sid
         name = name.lower()
-        desc = desc or self.irc.serverdata.get('serverdesc') or self.irc.botdata['serverdesc']
+        desc = desc or self.irc.serverdata.get('serverdesc') or conf.conf['bot']['serverdesc']
         if sid is None:  # No sid given; generate one!
             sid = self.sidgen.next_sid()
         assert len(sid) == 3, "Incorrect SID length"
@@ -293,79 +294,6 @@ class TS6BaseProtocol(IRCS2SProtocol):
         self.irc.users[source].away = text
 
     ### HANDLERS
-
-    def handle_events(self, data):
-        """Event handler for TS6 protocols.
-
-        This passes most commands to the various handle_ABCD() functions
-        elsewhere defined protocol modules, coersing various sender prefixes
-        from nicks and server names to UIDs and SIDs respectively,
-        whenever possible.
-
-        Commands sent without an explicit sender prefix will have them set to
-        the SID of the uplink server.
-        """
-        data = data.split(" ")
-        try:  # Message starts with a SID/UID prefix.
-            args = self.parsePrefixedArgs(data)
-            sender = args[0]
-            command = args[1]
-            args = args[2:]
-            # If the sender isn't in UID format, try to convert it automatically.
-            # Unreal's protocol, for example, isn't quite consistent with this yet!
-            sender_server = self._getSid(sender)
-            if sender_server in self.irc.servers:
-                # Sender is a server when converted from name to SID.
-                numeric = sender_server
-            else:
-                # Sender is a user.
-                numeric = self._getUid(sender)
-
-        # parsePrefixedArgs() will raise IndexError if the TS6 sender prefix is missing.
-        except IndexError:
-            # Raw command without an explicit sender; assume it's being sent by our uplink.
-            args = self.parseArgs(data)
-            numeric = self.irc.uplink
-            command = args[0]
-            args = args[1:]
-
-        if command == 'ENCAP':
-            # Special case for encapsulated commands (ENCAP), in forms like this:
-            # <- :00A ENCAP * SU 42XAAAAAC :GLolol
-            command = args[1]
-            args = args[2:]
-            log.debug("(%s) Rewriting incoming ENCAP to command %s (args: %s)", self.irc.name, command, args)
-
-        try:
-            func = getattr(self, 'handle_'+command.lower())
-        except AttributeError:  # unhandled command
-            pass
-        else:
-            parsed_args = func(numeric, command, args)
-            if parsed_args is not None:
-                return [numeric, command, parsed_args]
-
-    def handle_privmsg(self, source, command, args):
-        """Handles incoming PRIVMSG/NOTICE."""
-        # <- :70MAAAAAA PRIVMSG #dev :afasfsa
-        # <- :70MAAAAAA NOTICE 0ALAAAAAA :afasfsa
-        target = args[0]
-
-        # Coerse =#channel from Charybdis op moderated +z to @#channel.
-        if target.startswith('='):
-            target = '@' + target[1:]
-
-        # We use lowercase channels internally, but uppercase UIDs.
-        # Strip the target of leading prefix modes (for targets like @#channel)
-        # before checking whether it's actually a channel.
-        stripped_target = target.lstrip(''.join(self.irc.prefixmodes.values()))
-        if utils.isChannel(stripped_target):
-            target = self.irc.toLower(target)
-
-        return {'target': target, 'text': args[1]}
-
-    handle_notice = handle_privmsg
-
     def handle_kick(self, source, command, args):
         """Handles incoming KICKs."""
         # :70MAAAAAA KICK #test 70MAAAAAA :some reason

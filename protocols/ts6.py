@@ -5,7 +5,7 @@ ts6.py: PyLink protocol module for TS6-based IRCds (charybdis, elemental-ircd).
 import time
 import re
 
-from pylinkirc import utils
+from pylinkirc import utils, conf
 from pylinkirc.classes import *
 from pylinkirc.log import log
 from pylinkirc.protocols.ts6_common import *
@@ -15,6 +15,7 @@ S2S_BUFSIZE = 510
 class TS6Protocol(TS6BaseProtocol):
     def __init__(self, irc):
         super().__init__(irc)
+        self.protocol_caps |= {'slash-in-hosts'}
         self.casemapping = 'rfc1459'
         self.hook_map = {'SJOIN': 'JOIN', 'TB': 'TOPIC', 'TMODE': 'MODE', 'BMASK': 'MODE',
                          'EUID': 'UID', 'RSFNC': 'SVSNICK', 'ETB': 'TOPIC'}
@@ -46,7 +47,7 @@ class TS6Protocol(TS6BaseProtocol):
         # parameters: nickname, hopcount, nickTS, umodes, username,
         # visible hostname, IP address, UID, real hostname, account name, gecos
         ts = ts or int(time.time())
-        realname = realname or self.irc.botdata['realname']
+        realname = realname or conf.conf['bot']['realname']
         realhost = realhost or host
         raw_modes = self.irc.joinModes(modes)
         u = self.irc.users[uid] = IrcUser(nick, ts, uid, server, ident=ident, host=host, realname=realname,
@@ -338,7 +339,7 @@ class TS6Protocol(TS6BaseProtocol):
         f('CAPAB :QS ENCAP EX CHW IE KNOCK SAVE SERVICES TB EUID RSFNC EOPMOD SAVETS_100')
 
         f('SERVER %s 0 :%s' % (self.irc.serverdata["hostname"],
-                               self.irc.serverdata.get('serverdesc') or self.irc.botdata['serverdesc']))
+                               self.irc.serverdata.get('serverdesc') or conf.conf['bot']['serverdesc']))
 
         # Finally, end all the initialization with a PING - that's Charybdis'
         # way of saying end-of-burst :)
@@ -406,7 +407,7 @@ class TS6Protocol(TS6BaseProtocol):
         except IndexError:
             destination = self.irc.sid
         if self.irc.isInternalServer(destination):
-            self._send(destination, 'PONG %s %s' % (destination, source))
+            self._send(destination, 'PONG %s %s' % (destination, source), queue=False)
 
             if destination == self.irc.sid and not self.has_eob:
                 # Charybdis' idea of endburst is just sending a PING. No, really!
@@ -498,7 +499,7 @@ class TS6Protocol(TS6BaseProtocol):
         """Handles incoming EUID commands (user introduction)."""
         # <- :42X EUID GL 1 1437505322 +ailoswz ~gl 127.0.0.1 127.0.0.1 42XAAAAAB * * :realname
         nick = args[0]
-        self.checkCollision(nick)
+        self.check_nick_collision(nick)
         ts, modes, ident, host, ip, uid, realhost, accountname, realname = args[2:11]
         if realhost == '*':
             realhost = None
@@ -637,7 +638,7 @@ class TS6Protocol(TS6BaseProtocol):
         target = args[0]
         channel = self.irc.toLower(args[1])
         try:
-            ts = args[3]
+            ts = int(args[2])
         except IndexError:
             ts = int(time.time())
         # We don't actually need to process this; it's just something plugins/hooks can use

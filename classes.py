@@ -15,14 +15,16 @@ import hashlib
 from copy import deepcopy
 import inspect
 import re
-from collections import defaultdict, deque
+from collections import defaultdict
+import ipaddress
+import queue
 
 try:
     import ircmatch
 except ImportError:
     raise ImportError("PyLink requires ircmatch to function; please install it and try again.")
 
-from . import world, utils, structures, __version__
+from . import world, utils, structures, conf, __version__
 from .log import *
 
 ### Exceptions
@@ -32,7 +34,7 @@ class ProtocolError(RuntimeError):
 
 ### Internal classes (users, servers, channels)
 
-class Irc():
+class Irc(utils.DeprecatedAttributesObject):
     """Base IRC object for PyLink."""
 
     def __init__(self, netname, proto, conf):
@@ -41,6 +43,11 @@ class Irc():
         (a string), the name of the protocol module to use for this connection,
         and a configuration object.
         """
+        self.deprecated_attributes = {
+            'conf': 'Deprecated since 1.2; consider switching to conf.conf',
+            'botdata': "Deprecated since 1.2; consider switching to conf.conf['bot']",
+        }
+
         self.loghandlers = []
         self.name = netname
         self.conf = conf
@@ -49,15 +56,22 @@ class Irc():
         self.botdata = conf['bot']
         self.protoname = proto.__name__.split('.')[-1]  # Remove leading pylinkirc.protocols.
         self.proto = proto.Class(self)
+
+        # These options depend on self.serverdata from above to be set.
+        self.encoding = None
         self.pingfreq = self.serverdata.get('pingfreq') or 90
         self.pingtimeout = self.pingfreq * 2
 
-        self.queue = deque()
+        self.queue = None
 
         self.connected = threading.Event()
         self.aborted = threading.Event()
+        self.reply_lock = threading.RLock()
 
         self.pingTimer = None
+
+        # Sets the multiplier for autoconnect delay (grows with time).
+        self.autoconnect_active_multiplier = 1
 
         self.initVars()
 
@@ -75,7 +89,7 @@ class Irc():
         Initializes any channel loggers defined for the current network.
         """
         try:
-            channels = self.conf['logging']['channels'][self.name]
+            channels = conf.conf['logging']['channels'][self.name]
         except KeyError:  # Not set up; just ignore.
             return
 
@@ -100,15 +114,15 @@ class Irc():
         (Re)sets an IRC object to its default state. This should be called when
         an IRC object is first created, and on every reconnection to a network.
         """
-        self.botdata = self.conf['bot']
+        self.encoding = self.serverdata.get('encoding') or 'utf-8'
         self.pingfreq = self.serverdata.get('pingfreq') or 90
         self.pingtimeout = self.pingfreq * 3
 
-        self.connected.clear()
         self.pseudoclient = None
         self.lastping = time.time()
 
-        self.queue.clear()
+        self.maxsendq = self.serverdata.get('maxsendq', 4096)
+        self.queue = queue.Queue(self.maxsendq)
 
         # Internal variable to set the place and caller of the last command (in PM
         # or in a channel), used by fantasy command support.
@@ -166,12 +180,20 @@ class Irc():
 
     def processQueue(self):
         """Loop to process outgoing queue data."""
-        while not self.aborted.is_set():
-            if self.queue:  # Only process if there's data.
-                data = self.queue.popleft()
-                self._send(data)
-            throttle_time = self.serverdata.get('throttle_time', 0.01)
-            time.sleep(throttle_time)
+        while True:
+            throttle_time = self.serverdata.get('throttle_time', 0.005)
+            if not self.aborted.wait(throttle_time):
+                data = self.queue.get()
+                if data is None:
+                    log.debug('(%s) Stopping queue thread due to getting None as item', self.name)
+                    break
+                elif self not in world.networkobjects.values():
+                    log.debug('(%s) Stopping stale queue thread; no longer matches world.networkobjects', self.name)
+                    break
+                elif data:
+                    self._send(data)
+            else:
+                break
 
     def connect(self):
         """
@@ -214,8 +236,7 @@ class Irc():
                 ip = socket.getaddrinfo(ip, port, stype)[0][-1][0]
                 log.debug('(%s) Resolving address %s to %s', self.name, old_ip, ip)
 
-                # Enable SSL if set to do so. This requires a valid keyfile and
-                # certfile to be present.
+                # Enable SSL if set to do so.
                 self.ssl = self.serverdata.get('ssl')
                 if self.ssl:
                     log.info('(%s) Attempting SSL for this connection...', self.name)
@@ -227,6 +248,7 @@ class Irc():
                     context.options |= ssl.OP_NO_SSLv2
                     context.options |= ssl.OP_NO_SSLv3
 
+                    # Cert and key files are optional, load them if specified.
                     if certfile and keyfile:
                         try:
                             context.load_cert_chain(certfile, keyfile)
@@ -301,39 +323,56 @@ class Irc():
 
                     self.servers[self.sid] = IrcServer(None, host, internal=True,
                             desc=self.serverdata.get('serverdesc')
-                            or self.botdata['serverdesc'])
+                            or conf.conf['bot']['serverdesc'])
 
                     log.info('(%s) Starting ping schedulers....', self.name)
                     self.schedulePing()
                     log.info('(%s) Server ready; listening for data.', self.name)
+                    self.autoconnect_active_multiplier = 1  # Reset any extra autoconnect delays
                     self.run()
                 else:  # Configuration error :(
                     log.error('(%s) A configuration error was encountered '
                               'trying to set up this connection. Please check'
                               ' your configuration file and try again.',
                               self.name)
+            # self.run() or the protocol module it called raised an exception, meaning we've disconnected!
             # Note: socket.error, ConnectionError, IOError, etc. are included in OSError since Python 3.3,
             # so we don't need to explicitly catch them here.
             # We also catch SystemExit here as a way to abort out connection threads properly, and stop the
             # IRC connection from freezing instead.
             except (OSError, RuntimeError, SystemExit) as e:
-                # self.run() or the protocol module it called raised an
-                # exception, meaning we've disconnected!
-                log.error('(%s) Disconnected from IRC: %s: %s',
-                          self.name, type(e).__name__, str(e))
+                log.exception('(%s) Disconnected from IRC:', self.name)
 
             self.disconnect()
-
-            # Internal hook signifying that a network has disconnected.
-            self.callHooks([None, 'PYLINK_DISCONNECT', {}])
 
             # If autoconnect is enabled, loop back to the start. Otherwise,
             # return and stop.
             autoconnect = self.serverdata.get('autoconnect')
+
+            # Sets the autoconnect growth multiplier (e.g. a value of 2 multiplies the autoconnect
+            # time by 2 on every failure, etc.)
+            autoconnect_multiplier = self.serverdata.get('autoconnect_multiplier', 2)
+            autoconnect_max = self.serverdata.get('autoconnect_max', 1800)
+            # These values must at least be 1.
+            autoconnect_multiplier = max(autoconnect_multiplier, 1)
+            autoconnect_max = max(autoconnect_max, 1)
+
             log.debug('(%s) Autoconnect delay set to %s seconds.', self.name, autoconnect)
             if autoconnect is not None and autoconnect >= 1:
+                log.debug('(%s) Multiplying autoconnect delay %s by %s.', self.name, autoconnect, self.autoconnect_active_multiplier)
+                autoconnect *= self.autoconnect_active_multiplier
+                # Add a cap on the max. autoconnect delay, so that we don't go on forever...
+                autoconnect = min(autoconnect, autoconnect_max)
+
                 log.info('(%s) Going to auto-reconnect in %s seconds.', self.name, autoconnect)
-                time.sleep(autoconnect)
+                # Continue when either self.aborted is set or the autoconnect time passes.
+                # Compared to time.sleep(), this allows us to stop connections quicker if we
+                # break while while for autoconnect.
+                self.aborted.clear()
+                self.aborted.wait(autoconnect)
+
+                # Store in the local state what the autoconnect multiplier currently is.
+                self.autoconnect_active_multiplier *= autoconnect_multiplier
 
                 if self not in world.networkobjects.values():
                     log.debug('Stopping stale connect loop for old connection %r', self.name)
@@ -345,9 +384,14 @@ class Irc():
 
     def disconnect(self):
         """Handle disconnects from the remote server."""
+        was_successful = self.connected.is_set()
+        log.debug('(%s) disconnect: got %s for was_successful state', self.name, was_successful)
 
         log.debug('(%s) disconnect: Clearing self.connected state.', self.name)
         self.connected.clear()
+
+        log.debug('(%s) disconnect: Setting self.aborted to True.', self.name)
+        self.aborted.set()
 
         log.debug('(%s) Removing channel logging handlers due to disconnect.', self.name)
         while self.loghandlers:
@@ -356,25 +400,29 @@ class Irc():
         try:
             log.debug('(%s) disconnect: Shutting down socket.', self.name)
             self.socket.shutdown(socket.SHUT_RDWR)
-        except:  # Socket timed out during creation; ignore
-            pass
+        except Exception as e:  # Socket timed out during creation; ignore
+            log.debug('(%s) error on socket shutdown: %s: %s', self.name, type(e).__name__, e)
 
         self.socket.close()
 
+        # Stop the queue thread.
+        if self.queue:
+            # XXX: queue.Queue.queue isn't actually documented, so this is probably not reliable in the long run.
+            self.queue.queue.appendleft(None)
+
+        # Stop the ping timer.
         if self.pingTimer:
             log.debug('(%s) Canceling pingTimer at %s due to disconnect() call', self.name, time.time())
             self.pingTimer.cancel()
 
-        log.debug('(%s) disconnect: Setting self.aborted to True.', self.name)
-        self.aborted.set()
+        # Internal hook signifying that a network has disconnected.
+        self.callHooks([None, 'PYLINK_DISCONNECT', {'was_successful': was_successful}])
 
         log.debug('(%s) disconnect: Clearing state via initVars().', self.name)
         self.initVars()
 
     def run(self):
         """Main IRC loop which listens for messages."""
-        # Some magic below cause this to work, though anything that's
-        # not encoded in UTF-8 doesn't work very well.
         buf = b""
         data = b""
         while not self.aborted.is_set():
@@ -395,11 +443,11 @@ class Irc():
             elif (time.time() - self.lastping) > self.pingtimeout:
                 log.error('(%s) Connection timed out.', self.name)
                 return
+
             while b'\n' in buf:
                 line, buf = buf.split(b'\n', 1)
                 line = line.strip(b'\r')
-                # FIXME: respect other encodings?
-                line = line.decode("utf-8", "replace")
+                line = line.decode(self.encoding, "replace")
                 self.runline(line)
 
     def runline(self, line):
@@ -466,19 +514,24 @@ class Irc():
         # Safeguard against newlines in input!! Otherwise, each line gets
         # treated as a separate command, which is particularly nasty.
         data = data.replace('\n', ' ')
-        data = data.encode("utf-8") + b"\n"
-        stripped_data = data.decode("utf-8").strip("\n")
-        log.debug("(%s) -> %s", self.name, stripped_data)
+        encoded_data = data.encode(self.encoding, 'replace') + b"\n"
+
+        log.debug("(%s) -> %s", self.name, data)
 
         try:
-            self.socket.send(data)
+            self.socket.send(encoded_data)
         except (OSError, AttributeError):
-            log.debug("(%s) Dropping message %r; network isn't connected!", self.name, stripped_data)
+            log.exception("(%s) Failed to send message %r; did the network disconnect?", self.name, data)
 
     def send(self, data, queue=True):
         """send() wrapper with optional queueing support."""
+        if self.aborted.is_set():
+            log.debug('(%s) refusing to queue data %r as self.aborted is set', self.name, data)
+            return
         if queue:
-            self.queue.append(data)
+            # XXX: we don't really know how to handle blocking queues yet, so
+            # it's better to not expose that yet.
+            self.queue.put_nowait(data)
         else:
             self._send(data)
 
@@ -504,12 +557,15 @@ class Irc():
         """
         world.services['pylink'].call_cmd(self, source, text)
 
-    def msg(self, target, text, notice=False, source=None, loopback=True):
+    def msg(self, target, text, notice=None, source=None, loopback=True):
         """Handy function to send messages/notices to clients. Source
         is optional, and defaults to the main PyLink client if not specified."""
         if not text:
             return
 
+        if not (source or self.pseudoclient):
+            # No explicit source set and our main client wasn't available; abort.
+            return
         source = source or self.pseudoclient.uid
 
         if notice:
@@ -524,9 +580,15 @@ class Irc():
             # replies across relay.
             self.callHooks([source, cmd, {'target': target, 'text': text}])
 
-    def reply(self, text, notice=False, source=None, private=False, force_privmsg_in_private=False,
+    def _reply(self, text, notice=None, source=None, private=None, force_privmsg_in_private=False,
             loopback=True):
-        """Replies to the last caller in the right context (channel or PM)."""
+        """
+        Core of the reply() function - replies to the last caller in the right context
+        (channel or PM).
+        """
+        if private is None:
+            # Allow using private replies as the default, if no explicit setting was given.
+            private = conf.conf['bot'].get("prefer_private_replies")
 
         # Private reply is enabled, or the caller was originally a PM
         if private or (self.called_in in self.users):
@@ -541,12 +603,20 @@ class Irc():
 
         self.msg(target, text, notice=notice, source=source, loopback=loopback)
 
-    def error(self, text, notice=False, source=None, private=False, force_privmsg_in_private=False,
-            loopback=True):
+    def reply(self, *args, **kwargs):
+        """
+        Replies to the last caller in the right context (channel or PM).
+
+        This function wraps around _reply() and can be monkey-patched in a thread-safe manner
+        to temporarily redirect plugin output to another target.
+        """
+        with self.reply_lock:
+            self._reply(*args, **kwargs)
+
+    def error(self, text, **kwargs):
         """Replies with an error to the last caller in the right context (channel or PM)."""
         # This is a stub to alias error to reply
-        self.reply("Error: %s" % text, notice=notice, source=source, private=private,
-            force_privmsg_in_private=force_privmsg_in_private, loopback=loopback)
+        self.reply("Error: %s" % text, **kwargs)
 
     def toLower(self, text):
         """Returns a lowercase representation of text based on the IRC object's
@@ -946,7 +1016,7 @@ class Irc():
         Returns a detailed version string including the PyLink daemon version,
         the protocol module in use, and the server hostname.
         """
-        fullversion = 'PyLink-%s. %s :[protocol:%s]' % (__version__, self.hostname(), self.protoname)
+        fullversion = 'PyLink-%s. %s :[protocol:%s, encoding:%s]' % (__version__, self.hostname(), self.protoname, self.encoding)
         return fullversion
 
     def hostname(self):
@@ -1043,13 +1113,21 @@ class Irc():
 
     def getFriendlyName(self, entityid):
         """
-        Returns the friendly name of a SID or UID (server name for SIDs, nick for UID)."""
+        Returns the friendly name of a SID or UID (server name for SIDs, nick for UID).
+        """
         if entityid in self.servers:
             return self.servers[entityid].name
         elif entityid in self.users:
             return self.users[entityid].nick
         else:
             raise KeyError("Unknown UID/SID %s" % entityid)
+
+    def getFullNetworkName(self):
+        """
+        Returns the full network name (as defined by the "netname" option), or the
+        short network name if that isn't defined.
+        """
+        return self.serverdata.get('netname', self.name)
 
     def isOper(self, uid, allowAuthed=True, allowOper=True):
         """
@@ -1071,6 +1149,9 @@ class Irc():
         Checks whether the given user has operator status on PyLink, raising
         NotAuthorizedError and logging the access denial if not.
         """
+        log.warning("(%s) Irc.checkAuthenticated() is deprecated as of PyLink 1.2 and may be "
+                    "removed in a future relase. Consider migrating to the PyLink Permissions API.",
+                    self.name)
         lastfunc = inspect.stack()[1][3]
         if not self.isOper(uid, allowAuthed=allowAuthed, allowOper=allowOper):
             log.warning('(%s) Access denied for %s calling %r', self.name,
@@ -1083,8 +1164,12 @@ class Irc():
         Checks whether the given host, or given UID's hostmask matches the given nick!user@host
         glob.
 
-        If the target given is a UID, and the ip or realhost options are True, this will also match
-        against the target's IP address and real host, respectively.
+        If the target given is a UID, and the 'ip' or 'realhost' options are True, this will also
+        match against the target's IP address and real host, respectively.
+
+        This function respects IRC casemappings (rfc1459 and ascii). If the given target is a UID,
+        and the 'ip' option is enabled, the host portion of the glob is also matched as a CIDR
+        range.
         """
         # Get the corresponding casemapping value used by ircmatch.
         if self.proto.casemapping == 'rfc1459':
@@ -1095,46 +1180,78 @@ class Irc():
         # Try to convert target into a UID. If this fails, it's probably a hostname.
         target = self.nickToUid(target) or target
 
-        # Prepare a list of hosts to check against.
-        if target in self.users:
-            if glob.startswith(('$', '!$')):
-                # !$exttarget inverts the given match.
-                invert = glob.startswith('!$')
+        # Allow queries like !$exttarget to invert the given match.
+        invert = glob.startswith('!')
+        if invert:
+            glob = glob.lstrip('!')
 
-                # Exttargets start with $. Skip regular ban matching and find the matching ban handler.
-                glob = glob.lstrip('$!')
-                exttargetname = glob.split(':', 1)[0]
-                handler = world.exttarget_handlers.get(exttargetname)
+        def match_host_core():
+            """
+            Core processor for matchHost(), minus the inversion check.
+            """
+            # Work with variables in the matchHost() scope, from
+            # http://stackoverflow.com/a/8178808
+            nonlocal glob
 
-                if handler:
-                    # Handler exists. Return what it finds.
-                    result = handler(self, glob, target)
-                    log.debug('(%s) Got %s from exttarget %s in matchHost() glob $%s for target %s',
-                              self.name, result, exttargetname, glob, target)
-                    if invert:  # Anti-exttarget was specified.
-                        result = not result
-                    return result
-                else:
-                    log.debug('(%s) Unknown exttarget %s in matchHost() glob $%s', self.name,
-                              exttargetname, glob)
-                    return False
+            # Prepare a list of hosts to check against.
+            if target in self.users:
+                if glob.startswith('$'):
+                    # Exttargets start with $. Skip regular ban matching and find the matching ban handler.
+                    glob = glob.lstrip('$')
+                    exttargetname = glob.split(':', 1)[0]
+                    handler = world.exttarget_handlers.get(exttargetname)
 
-            hosts = {self.getHostmask(target)}
+                    if handler:
+                        # Handler exists. Return what it finds.
+                        result = handler(self, glob, target)
+                        log.debug('(%s) Got %s from exttarget %s in matchHost() glob $%s for target %s',
+                                  self.name, result, exttargetname, glob, target)
+                        return result
+                    else:
+                        log.debug('(%s) Unknown exttarget %s in matchHost() glob $%s', self.name,
+                                  exttargetname, glob)
+                        return False
 
-            if ip:
-                hosts.add(self.getHostmask(target, ip=True))
+                hosts = {self.getHostmask(target)}
 
-            if realhost:
-                hosts.add(self.getHostmask(target, realhost=True))
-        else:  # We were given a host, use that.
-            hosts = [target]
+                if ip:
+                    hosts.add(self.getHostmask(target, ip=True))
 
-        # Iterate over the hosts to match using ircmatch.
-        for host in hosts:
-            if ircmatch.match(casemapping, glob, host):
-                return True
+                    # HACK: support CIDR hosts in the hosts portion
+                    try:
+                        header, cidrtarget = glob.split('@', 1)
+                        log.debug('(%s) Processing CIDRs for %s (full host: %s)', self.name,
+                                  cidrtarget, glob)
+                        # Try to parse the host portion as a CIDR range
+                        network = ipaddress.ip_network(cidrtarget)
 
-        return False
+                        log.debug('(%s) Found CIDR for %s, replacing target host with IP %s', self.name,
+                                  realhost, target)
+                        real_ip = self.users[target].ip
+                        if ipaddress.ip_address(real_ip) in network:
+                            # If the CIDR matches, hack around the host matcher by pretending that
+                            # the lookup target was the IP and not the CIDR range!
+                            glob = '@'.join((header, real_ip))
+                    except ValueError:
+                        pass
+
+                if realhost:
+                    hosts.add(self.getHostmask(target, realhost=True))
+
+            else:  # We were given a host, use that.
+                hosts = [target]
+
+            # Iterate over the hosts to match using ircmatch.
+            for host in hosts:
+                if ircmatch.match(casemapping, glob, host):
+                    return True
+
+            return False
+
+        result = match_host_core()
+        if invert:
+            result = not result
+        return result
 
 class IrcUser():
     """PyLink IRC user class."""
@@ -1174,7 +1291,7 @@ class IrcUser():
         self.manipulatable = manipulatable
 
     def __repr__(self):
-        return 'IrcUser(%s)' % self.__dict__
+        return 'IrcUser(%s/%s)' % (self.uid, self.nick)
 
 class IrcServer():
     """PyLink IRC server class.
@@ -1193,7 +1310,7 @@ class IrcServer():
         self.desc = desc
 
     def __repr__(self):
-        return 'IrcServer(%s)' % self.__dict__
+        return 'IrcServer(%s)' % self.name
 
 class IrcChannel():
     """PyLink IRC channel class."""
@@ -1214,7 +1331,7 @@ class IrcChannel():
         self.name = name
 
     def __repr__(self):
-        return 'IrcChannel(%s)' % self.__dict__
+        return 'IrcChannel(%s)' % self.name
 
     def removeuser(self, target):
         """Removes a user from a channel."""
@@ -1311,6 +1428,9 @@ class Protocol():
         self.conf_keys = {'ip', 'port', 'hostname', 'sid', 'sidrange', 'protocol', 'sendpass',
                           'recvpass'}
 
+        # Defines a set of PyLink protocol capabilities
+        self.protocol_caps = set()
+
     def validateServerConf(self):
         """Validates that the server block given contains the required keys."""
         for k in self.conf_keys:
@@ -1319,28 +1439,32 @@ class Protocol():
         port = self.irc.serverdata['port']
         assert type(port) == int and 0 < port < 65535, "Invalid port %r for network %s" % (port, self.irc.name)
 
-    def parseArgs(self, args):
-        """Parses a string of RFC1459-style arguments split into a list, where ":" may
+    @staticmethod
+    def parseArgs(args):
+        """
+        Parses a string or list of of RFC1459-style arguments, where ":" may
         be used for multi-word arguments that last until the end of a line.
         """
+        if isinstance(args, str):
+            args = args.split(' ')
+
         real_args = []
         for idx, arg in enumerate(args):
-            real_args.append(arg)
-            # If the argument starts with ':' and ISN'T the first argument.
-            # The first argument is used for denoting the source UID/SID.
             if arg.startswith(':') and idx != 0:
-                # : is used for multi-word arguments that last until the end
-                # of the message. We can use list splicing here to turn them all
-                # into one argument.
-                # Set the last arg to a joined version of the remaining args
-                arg = args[idx:]
-                arg = ' '.join(arg)[1:]
-                # Cut the original argument list right before the multi-word arg,
-                # and then append the multi-word arg.
-                real_args = args[:idx]
-                real_args.append(arg)
+                # ":" is used to begin multi-word arguments that last until the end of the message.
+                # Use list splicing here to join them into one argument, and then add it to our list of args.
+                joined_arg = ' '.join(args[idx:])[1:]  # Cut off the leading : as well
+                real_args.append(joined_arg)
                 break
+            real_args.append(arg)
+
         return real_args
+
+    def hasCap(self, capab):
+        """
+        Returns whether this protocol module instance has the requested capability.
+        """
+        return capab.lower() in self.protocol_caps
 
     def removeClient(self, numeric):
         """Internal function to remove a client from our internal state."""
@@ -1357,7 +1481,7 @@ class Protocol():
         log.debug('Removing client %s from self.irc.servers[%s].users', numeric, sid)
         self.irc.servers[sid].users.discard(numeric)
 
-    def updateTS(self, sender, channel, their_ts, modes=[]):
+    def updateTS(self, sender, channel, their_ts, modes=None):
         """
         Merges modes of a channel given the remote TS and a list of modes.
         """
@@ -1367,6 +1491,9 @@ class Protocol():
         #                       | our TS lower | TS equal | their TS lower
         # mode origin is us     |   OVERWRITE  |   MERGE  |    IGNORE
         # mode origin is uplink |    IGNORE    |   MERGE  |   OVERWRITE
+
+        if modes is None:
+            modes = []
 
         def _clear():
             log.debug("(%s) Clearing local modes from channel %s due to TS change", self.irc.name,
@@ -1430,10 +1557,11 @@ class Protocol():
         target = self.irc.nickToUid(target) or target
         return target
 
-    def parsePrefixedArgs(self, args):
+    @classmethod
+    def parsePrefixedArgs(cls, args):
         """Similar to parseArgs(), but stripping leading colons from the first argument
         of a line (usually the sender field)."""
-        args = self.parseArgs(args)
+        args = cls.parseArgs(args)
         args[0] = args[0].split(':', 1)[1]
         return args
 
@@ -1526,5 +1654,4 @@ class Protocol():
 
     def handle_error(self, numeric, command, args):
         """Handles ERROR messages - these mean that our uplink has disconnected us!"""
-        self.irc.connected.clear()
         raise ProtocolError('Received an ERROR, disconnecting!')

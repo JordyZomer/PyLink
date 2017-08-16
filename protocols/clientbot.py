@@ -4,7 +4,7 @@ import base64
 
 from pylinkirc import utils, conf
 from pylinkirc.log import log
-from pylinkirc.classes import Protocol, IrcUser, IrcServer
+from pylinkirc.classes import Protocol, IrcUser, IrcServer, ProtocolError
 
 FALLBACK_REALNAME = 'PyLink Relay Mirror Client'
 COMMON_PREFIXMODES = [('h', 'halfop'), ('a', 'admin'), ('q', 'owner'), ('y', 'owner')]
@@ -13,6 +13,8 @@ IRCV3_CAPABILITIES = {'multi-prefix', 'sasl'}
 class ClientbotWrapperProtocol(Protocol):
     def __init__(self, irc):
         super().__init__(irc)
+
+        self.protocol_caps = {'clear-channels-on-leave', 'slash-in-nicks', 'slash-in-hosts', 'underscore-in-hosts'}
 
         self.has_eob = False
 
@@ -25,10 +27,6 @@ class ClientbotWrapperProtocol(Protocol):
         self.caps = {}
         self.ircv3_caps = set()
         self.ircv3_caps_available = {}
-
-        # Initialize counter-based pseudo UID  generators
-        self.uidgen = utils.PUIDGenerator('PUID')
-        self.sidgen = utils.PUIDGenerator('PSID')
 
         # Tracks the users sent in a list of /who replies, so that users can be bursted all at once
         # when ENDOFWHO is received.
@@ -55,6 +53,10 @@ class ClientbotWrapperProtocol(Protocol):
 
     def connect(self):
         """Initializes a connection to a server."""
+        # (Re)initialize counter-based pseudo UID generators
+        self.uidgen = utils.PUIDGenerator('PUID')
+        self.sidgen = utils.PUIDGenerator('PSID')
+
         self.has_eob = False
         ts = self.irc.start_ts
         f = lambda text: self.irc.send(text, queue=False)
@@ -102,7 +104,7 @@ class ClientbotWrapperProtocol(Protocol):
         """
 
         server = server or self.irc.sid
-        uid = self.uidgen.next_uid()
+        uid = self.uidgen.next_uid(prefix=nick)
 
         ts = ts or int(time.time())
 
@@ -120,7 +122,7 @@ class ClientbotWrapperProtocol(Protocol):
         STUB: Pretends to spawn a new server with a subset of the given options.
         """
         name = name.lower()
-        sid = self.sidgen.next_sid()
+        sid = self.sidgen.next_sid(prefix=name)
         self.irc.servers[sid] = IrcServer(uplink, name, internal=internal)
         return sid
 
@@ -149,6 +151,7 @@ class ClientbotWrapperProtocol(Protocol):
         if self.irc.pseudoclient and client == self.irc.pseudoclient.uid:
             self.irc.send('JOIN %s' % channel)
             # Send /names and /who requests right after
+            self.irc.send('MODE %s' % channel)
             self.irc.send('NAMES %s' % channel)
             self.irc.send('WHO %s' % channel)
         else:
@@ -336,12 +339,13 @@ class ClientbotWrapperProtocol(Protocol):
 
         Limited (internal) nick collision checking is done here to prevent Clientbot users from
         being confused with virtual clients, and vice versa."""
-        # If this sender isn't known or it is one of our virtual clients, spawn a new one.
-        # spawnClient() will take care of any nick collisions caused by new, Clientbot users
-        # taking the same nick as one of our virtual clients.
+        self._validateNick(nick)
         idsource = self.irc.nickToUid(nick)
         is_internal = self.irc.isInternalClient(idsource)
 
+        # If this sender isn't known or it is one of our virtual clients, spawn a new one.
+        # This also takes care of any nick collisions caused by new, Clientbot users
+        # taking the same nick as one of our virtual clients, and will force the virtual client to lose.
         if (not idsource) or (is_internal and self.irc.pseudoclient and idsource != self.irc.pseudoclient.uid):
             if idsource:
                 log.debug('(%s) Nick-colliding virtual client %s/%s', self.irc.name, idsource, nick)
@@ -679,6 +683,13 @@ class ClientbotWrapperProtocol(Protocol):
             return {'channel': channel, 'users': names, 'modes': self.irc.channels[channel].modes,
                     'parse_as': "JOIN"}
 
+    def _validateNick(self, nick):
+        """
+        Checks to make sure a nick doesn't clash with a PUID.
+        """
+        if nick in self.irc.users or nick in self.irc.servers:
+            raise ProtocolError("Got bad nick %s from IRC which clashes with a PUID. Is someone trying to spoof users?" % nick)
+
     def handle_352(self, source, command, args):
         """
         Handles 352 / RPL_WHOREPLY.
@@ -692,6 +703,8 @@ class ClientbotWrapperProtocol(Protocol):
         status = args[6]
         # Hopcount and realname field are together. We only care about the latter.
         realname = args[-1].split(' ', 1)[-1]
+
+        self._validateNick(nick)
         uid = self.irc.nickToUid(nick)
 
         if uid is None:
@@ -844,6 +857,23 @@ class ClientbotWrapperProtocol(Protocol):
             if (self.irc.pseudoclient and source != self.irc.pseudoclient.uid) or not self.irc.pseudoclient:
                 return {'target': target, 'modes': changedmodes, 'channeldata': oldobj}
 
+    def handle_324(self, source, command, args):
+        """Handles MODE announcements via RPL_CHANNELMODEIS (i.e. the response to /mode #channel)"""
+        # -> MODE #test
+        # <- :midnight.vpn 324 GL #test +nt
+        # <- :midnight.vpn 329 GL #test 1491773459
+        channel = self.irc.toLower(args[1])
+        modes = args[2:]
+        log.debug('(%s) Got RPL_CHANNELMODEIS (324) modes %s for %s', self.irc.name, modes, channel)
+        changedmodes = self.irc.parseModes(channel, modes)
+        self.irc.applyModes(channel, changedmodes)
+
+    def handle_329(self, source, command, args):
+        """Handles TS announcements via RPL_CREATIONTIME."""
+        channel = self.irc.toLower(args[1])
+        ts = int(args[2])
+        self.irc.channels[channel].ts = ts
+
     def handle_nick(self, source, command, args):
         """Handles NICK changes."""
         # <- :GL|!~GL@127.0.0.1 NICK :GL_
@@ -891,7 +921,7 @@ class ClientbotWrapperProtocol(Protocol):
         """
         Handles incoming PING requests.
         """
-        self.irc.send('PONG :%s' % args[0])
+        self.irc.send('PONG :%s' % args[0], queue=False)
 
     def handle_pong(self, source, command, args):
         """
@@ -906,6 +936,10 @@ class ClientbotWrapperProtocol(Protocol):
         # <- :sender NOTICE somenick :afasfsa
         target = args[0]
 
+        if self.irc.isInternalClient(source) or self.irc.isInternalServer(source):
+            log.warning('(%s) Received %s to %s being routed the wrong way!', self.irc.name, command, target)
+            return
+
         # We use lowercase channels internally.
         if utils.isChannel(target):
             target = self.irc.toLower(target)
@@ -913,12 +947,16 @@ class ClientbotWrapperProtocol(Protocol):
             target = self.irc.nickToUid(target)
         if target:
             return {'target': target, 'text': args[1]}
+    handle_notice = handle_privmsg
 
     def handle_quit(self, source, command, args):
         """Handles incoming QUITs."""
+        if self.irc.pseudoclient and source == self.irc.pseudoclient.uid:
+            # Someone faked a quit from us? We should abort.
+            raise ProtocolError("Received QUIT from uplink (%s)" % args[0])
+
         self.quit(source, args[0])
         return {'text': args[0]}
 
-    handle_notice = handle_privmsg
 
 Class = ClientbotWrapperProtocol

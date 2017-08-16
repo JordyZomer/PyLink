@@ -38,7 +38,7 @@ Each command function takes 3 arguments: `irc, source, args`.
 - **source**: The numeric of the sender. This will usually be a UID (for users) or a SID (for server).
 - **args**: A `list` of space-separated command arguments (excluding the command name) that the command was called with. For example, `/msg PyLink hello world 1234` would give an `args` list of `['world', '1234']`
 
-(Unfortunately, this means that for now, any fancy argument parsing has to be done manually.)
+As of PyLink 1.2, there are two ways for a plugin to parse arguments: as a raw list of strings, or with `utils.IRCParser` (an [argparse](https://docs.python.org/3/library/argparse.html) wrapper). More information on using `utils.IRCParser()` can be found in the page ["using IRCParser"](using-ircparser.md).
 
 Command handlers do not return anything and can raise exceptions, which are caught by the core and automatically return an error message.
 
@@ -58,6 +58,10 @@ are preferred.
 `irc.reply()` is a special form of `irc.msg` in that it automatically finds the target to reply to. If the command was called in a channel using fantasy, it will send the reply in that channel. Otherwise, the reply will be sent in a PM to the caller.
 
 The sender UID for both can be set using the `source` argument, and defaults to the main PyLink client.
+
+## Access checking for commands
+
+See the [Permissions API documentation](permissions-api.md) on how to restrict commands to certain users.
 
 ## Special triggers for plugin (un)loading
 

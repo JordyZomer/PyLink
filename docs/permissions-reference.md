@@ -3,6 +3,7 @@
 Below is a list of all the permissions defined by PyLink and its official plugins. For instructions on how to fine-tune permissions, see [example-permissions.yml](../example-permissions.yml).
 
 ## PyLink Core
+- `core.clearqueue` - Allows access to the `clearqueue` command.
 - `core.shutdown` - Allows access to the `shutdown` command.
 - `core.load` - Allows access to the `load` command.
 - `core.unload` - Allows access to the `unload` command.
@@ -60,6 +61,9 @@ Remote versions of the `manage`, `list`, `sync`, and `clear` commands also exist
 - `exec.raw` - Allows access to the `raw` command.
 - `exec.inject` - Allows access to the `inject` command.
 
+## Global
+- `global.global` - Allows access to the `global` command.
+
 ## Networks
 - `networks.disconnect` - Allows access to the `disconnect` command.
 - `networks.autoconnect` - Allows access to the `autoconnect` command.
@@ -83,9 +87,13 @@ Remote versions of the `manage`, `list`, `sync`, and `clear` commands also exist
 - `relay.linkacl` - Allows access to the `linkacl` command. **With the default permissions set, this is granted to all opers.**
 - `relay.linkacl.view` - Allows access to the `view` command. **With the default permissions set, this is granted to all opers.**
 - `relay.link` - Allows access to the `link` command. **With the default permissions set, this is granted to all opers.**
+- `relay.link.force` - Allows access to the `--force` option in the `link` command (skip TS and target network is connected checks).
 - `relay.linked` - Allows access to the `link` command. **With the default permissions set, this is granted to all users.**
 - `relay.purge` - Allows access to the `purge` command.
 - `relay.savedb` - Allows access to the `savedb` command.
 
 ## Servermaps
 - `servermaps.map` - Allows access to the `map` and `localmap` commands.
+
+## Stats
+- `stats.uptime` - Allows access to the `stats` command.
