@@ -71,6 +71,14 @@ pylink:
     # of all database-enabled plugins to take effect.
     #save_delay: 300
 
+    # Determines the preferred ban style that PyLink will use. The following values are supported:
+    # 1: *!*@host
+    # 2: *!ident@host
+    # 3: *!ident@*.isp
+    # 4: *!*@*.isp
+    # *.isp is evaluated to be the part of a hostmask after the first : or ., if the host is not
+    # detected as a vHost
+
 login:
     # NOTE: for users migrating from PyLink < 1.1, the old login:user/login:password settings
     # have been deprecated. We strongly recommend migrating to the new "accounts:" block below, as

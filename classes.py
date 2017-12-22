@@ -1736,9 +1736,96 @@ class BaseChannel(structures.DeprecatedAttributesObject, structures.CamelCaseToS
 
         return sorted(result, key=self.sort_prefixes)
 
+    def make_banmask(self, uid):
+        raise NotImplementedError
+
+    def set_ban(self, target):
+        raise NotImplementedError
+
 class Channel(BaseChannel):
     """PyLink IRC channel class."""
-    pass
+
+    _IPV4_LIKE_RE = re.compile(r"^(\d){1,3}\.(\d){1,3}\.([0-9a-z]){1,3}\.([0-9a-z]){1,3}$")
+    _IPV6_LIKE_RE = re.compile(r"^([0-9a-z]{1,4}(\:{1,2})){1,7}[0-9a-z]{1,4}$")
+
+    @classmethod
+    @functools.lru_cache(maxsize=2048)
+    def _make_smartban(cls, hostmask):
+        """
+        Creates a "smart" ban given a user's hostname. This aims to implement
+        sane bans in the style *!*@*.isp.net, but taking into consideration
+        vHosts and uncloaked/unreversed IPs.
+        """
+        if '/' in hostmask or hostmask.endswith('.'):
+            # Leave obvious vHosts as is.
+            return hostmask
+        elif cls._IPV4_LIKE_RE.match(hostmask):
+            # For IPv4 address like 123.1.2.3 or 123.1.x.d, keep the first
+            # two octets and replace the rest with a *
+            keep = '.'.join(hostmask.split('.', 2)[:2])
+            return '%s.*' % keep
+        elif cls._IPV6_LIKE_RE.match(hostmask):
+            # This is really lazy...
+            if '::' in hostmask:
+                return '%s::*' % hostmask.split('::', 1)[0]
+
+            keep = ':'.join(hostmask.split(':', 4)[:4])
+            return '%s:*' % keep
+        elif ':' in hostmask:
+            # Likely a reversed unreal-style IPv6 cloak: e.g. 2636D9B1:484C2B21:6149628:IP
+            return '*:' + hostmask.split(':', 1)[1]
+        elif len(hostmask.split('.')) >= 3:
+            # Only do a *.isp.net split on hosts with 3 or more parts. This is because
+            # banning *.net or *.com is obviously not what we want to do.
+            return '*.' + hostmask.split('.', 1)[1]
+        # If we got here, it means the smartest ban is just the complete host itself :)
+        return hostmask
+
+    @classmethod
+    def _make_banmask(cls, hostmask, bantype):
+        """
+        Creates a ban mask given a user object and a ban type.
+        """
+        nick, identhost = hostmask.split('!', 1)
+        ident, host = identhost.split('@', 1)
+
+        # 1: *!*@host
+        # 2: *!ident@host
+        # 3: *!ident@*.isp
+        # 4: *!*@*.isp
+        if bantype == 1:
+            return '*!*@%s' % host
+        elif bantype == 2:
+            return '*!%s@%s' % (ident, host)
+        elif bantype == 3:
+            return '*!%s@%s' % (ident, cls._make_smartban(host))
+        elif bantype == 4:
+            return '*!*@%s' % cls._make_smartban(host)
+        else:
+            raise NotImplementedError("Unsupported ban type %s" % bantype)
+
+    def make_banmask(self, uid):
+        """
+        Creates a ban mask for the given UID.
+        """
+        bantype = self._irc.serverdata.get('preferred_bantype') or \
+            conf.conf['pylink'].get('preferred_bantype') or 1
+
+        if bantype not in (1,2,3,4):
+            log.warning('(%s) Ignoring invalid ban type %s', self.name, bantype)
+            bantype = 1
+
+        hostmask = self._irc.get_hostmask(uid)
+        return self._make_banmask(hostmask, bantype)
+
+    def set_ban(self, target):
+        """
+        Sets a ban on the target, where target is a UID.
+        """
+        assert target in self._irc.users, 'Unknown target %r' % target
+        assert 'ban' in self._irc.cmodes, 'IRC-type protocol but no ban mode?'
+        self._irc.mode(self._irc.pseudoclient.uid, self.name,
+                       [('+' + self._irc.cmodes['ban'], self.make_banmask(target))])
 
 IrcChannel = Channel
 
