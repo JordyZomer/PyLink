@@ -30,20 +30,6 @@ from .utils import ProtocolError  # Compatibility with PyLink 1.x
 
 ### Internal classes (users, servers, channels)
 
-class ChannelState(structures.IRCCaseInsensitiveDict):
-    """
-    A dictionary storing channels case insensitively. Channel objects are initialized on access.
-    """
-    def __getitem__(self, key):
-        key = self._keymangle(key)
-
-        if key not in self._data:
-            log.debug('(%s) ChannelState: creating new channel %s in memory', self._irc.name, key)
-            self._data[key] = newchan = Channel(self._irc, key)
-            return newchan
-
-        return self._data[key]
-
 class PyLinkNetworkCore(structures.DeprecatedAttributesObject, structures.CamelCaseToSnakeCase):
     """Base IRC object for PyLink."""
 
@@ -1646,11 +1632,12 @@ class Server():
 
 IrcServer = Server
 
-class Channel(structures.DeprecatedAttributesObject, structures.CamelCaseToSnakeCase, structures.CopyWrapper):
-    """PyLink IRC channel class."""
+class BaseChannel(structures.DeprecatedAttributesObject, structures.CamelCaseToSnakeCase, structures.CopyWrapper):
+    """Base class for store channels / chat rooms."""
 
     def __init__(self, irc, name=None):
         # Initialize variables, such as the topic, user list, TS, who's opped, etc.
+        self.name = name
         self.users = set()
         self.modes = set()
         self.topic = ''
@@ -1660,16 +1647,13 @@ class Channel(structures.DeprecatedAttributesObject, structures.CamelCaseToSnake
         self._irc = irc
 
         # Determines whether a topic has been set here or not. Protocol modules
-        # should set this.
+        # should set this when they first receive or set a TOPIC.
         self.topicset = False
-
-        # Saves the channel name (may be useful to plugins, etc.)
-        self.name = name
 
         self.deprecated_attributes = {'removeuser': 'Deprecated in 2.0; use remove_user() instead!'}
 
     def __repr__(self):
-        return 'Channel(%s)' % self.name
+        return "%s(%s)" % (self.__class__.__name__, self.name)
 
     def remove_user(self, target):
         """Removes a user from a channel."""
@@ -1751,7 +1735,33 @@ class Channel(structures.DeprecatedAttributesObject, structures.CamelCaseToSnake
                 result.append(mode)
 
         return sorted(result, key=self.sort_prefixes)
+
+class Channel(BaseChannel):
+    """PyLink IRC channel class."""
+    pass
+
 IrcChannel = Channel
+
+class ChannelState(structures.IRCCaseInsensitiveDict):
+    """
+    A dictionary storing channels case insensitively. Channel objects are initialized on access.
+    """
+    CHANNEL_CLASS = Channel
+
+    def __getitem__(self, key):
+        key = self._keymangle(key)
+
+        if key not in self._data:
+            log.debug('(%s) ChannelState: creating new channel %s in memory', self._irc.name, key)
+            self._data[key] = newchan = self.CHANNEL_CLASS(self._irc, key)
+            return newchan
+
+        return self._data[key]
+
+    def __repr__(self):
+        return '<%s for %r using type %r>' % (self.__class__.__name__,
+                                              self._irc.name,
+                                              self.CHANNEL_CLASS.__name__)
 
 class PUIDGenerator():
     """
